@@ -2,8 +2,8 @@ using '../../infra/main.bicep'
 
 param accountName = '<existing-account-name>'
 param databaseName = 'testdb'
-param containerName = 's4-quantizedFlat'
-param partitionKeyPath = '/docid'
+param containerName = 's4-quantizedFlat-sessionid'
+param partitionKeyPaths = ['/sessionid']
 param autoscaleMaxThroughput = 150000
 param vectorPath = '/emb'
 param vectorIndexType = 'quantizedFlat'

@@ -172,6 +172,9 @@ CAPTURE_RU_CHARGES = _bool_env("CAPTURE_RU_CHARGES", True)
 PARTITION_KEY_RANGE_RPS_ENABLED = _bool_env("PARTITION_KEY_RANGE_RPS_ENABLED", False)
 PAYLOAD_BYTES = _int_env("PAYLOAD_BYTES", 5000, minimum=0)
 FAKE_DATA_VECTOR_DIM = _int_env("FAKE_DATA_VECTOR_DIM", 1536, minimum=0)
+SESSION_ID_ENABLED = _bool_env("SESSION_ID_ENABLED", False)
+SESSION_ID_MIN_DOCS = _int_env("SESSION_ID_MIN_DOCS", 10, minimum=1)
+SESSION_ID_MAX_DOCS = _int_env("SESSION_ID_MAX_DOCS", 1000, minimum=1)
 LIVE_INTERVAL_SEC = _float_env("LIVE_INTERVAL_SEC", 1.0, minimum=0.1)
 METRICS_SAMPLE_INTERVAL_SEC = _float_env("METRICS_SAMPLE_INTERVAL_SEC", LIVE_INTERVAL_SEC, minimum=0.1)
 METRICS_TIMING_SAMPLE_INTERVAL = _int_env("METRICS_TIMING_SAMPLE_INTERVAL", 1)
@@ -182,6 +185,13 @@ DOC_JSON_FORMAT = os.getenv("DOC_JSON_FORMAT", "jsonl").strip().lower()
 READ_BATCH_SIZE = _int_env("READ_BATCH_SIZE", BULK_SIZE)
 DOC_QUEUE_MULTIPLIER = _int_env("DOC_QUEUE_MULTIPLIER", 4)
 PARTITION_KEY_FIELD = os.getenv("PARTITION_KEY_FIELD", "").strip()
+_partition_key_fields_value = os.getenv("PARTITION_KEY_FIELDS", "").strip()
+PARTITION_KEY_FIELDS = tuple(
+    field.strip().lstrip("/") for field in _partition_key_fields_value.split(",") if field.strip().lstrip("/")
+) or ((PARTITION_KEY_FIELD,) if PARTITION_KEY_FIELD else ())
+DOCUMENT_ID_FALLBACK_FIELD = os.getenv(
+    "DOCUMENT_ID_FALLBACK_FIELD", PARTITION_KEY_FIELD or "docid"
+).strip().lstrip("/")
 COSMOS_ERROR_SAMPLE_LIMIT = _int_env("COSMOS_ERROR_SAMPLE_LIMIT", 3, minimum=0)
 EFFECTIVE_TOTAL_DOCS = min(TOTAL_DOCS, MAX_TOTAL_DOCS) if MAX_TOTAL_DOCS is not None else TOTAL_DOCS
 CSV_OUTPUT_ENABLED = _bool_env("CSV_OUTPUT_ENABLED", True)
@@ -199,11 +209,17 @@ CSV_EXCLUDED_FIELDS = {
 if DATA_TYPE not in {"fake", "file"}:
     raise ValueError("DATA_TYPE must be one of: fake, file")
 
+if SESSION_ID_MAX_DOCS < SESSION_ID_MIN_DOCS:
+    raise ValueError("SESSION_ID_MAX_DOCS must be greater than or equal to SESSION_ID_MIN_DOCS")
+
 if DATA_TYPE == "file" and not DOC_JSON_PATH:
     raise ValueError("DOC_JSON_PATH is required when DATA_TYPE=file")
 
-if DATA_TYPE == "file" and not PARTITION_KEY_FIELD:
-    raise ValueError("PARTITION_KEY_FIELD is required when DATA_TYPE=file")
+if DATA_TYPE == "file" and not PARTITION_KEY_FIELDS:
+    raise ValueError("PARTITION_KEY_FIELDS or PARTITION_KEY_FIELD is required when DATA_TYPE=file")
+
+if not DOCUMENT_ID_FALLBACK_FIELD:
+    raise ValueError("DOCUMENT_ID_FALLBACK_FIELD must not be empty")
 
 if DOC_JSON_FORMAT not in {"array", "jsonl", "multiple_values"}:
     raise ValueError("DOC_JSON_FORMAT must be one of: array, jsonl, multiple_values")

@@ -59,6 +59,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="container_name",
         help="Override COSMOS_CONTAINER_NAME from .env.",
     )
+    parser.add_argument(
+        "--partition-key-mode",
+        "--partition_key_mode",
+        choices=("hpk", "docid", "sessionid"),
+        dest="partition_key_mode",
+        help=(
+            "Select partition keys for this run: hpk (sessionid,docid), "
+            "docid, or sessionid."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -84,6 +94,18 @@ def apply_overrides(args: argparse.Namespace) -> None:
 
     if args.container_name:
         os.environ["COSMOS_CONTAINER_NAME"] = args.container_name
+
+    if args.partition_key_mode:
+        partition_key_fields = {
+            "hpk": "sessionid,docid",
+            "docid": "docid",
+            "sessionid": "sessionid",
+        }[args.partition_key_mode]
+        os.environ["SESSION_ID_ENABLED"] = str(
+            args.partition_key_mode != "docid"
+        ).lower()
+        os.environ["PARTITION_KEY_FIELDS"] = partition_key_fields
+        os.environ["DOCUMENT_ID_FALLBACK_FIELD"] = "docid"
 
 
 def main(argv: list[str] | None = None) -> None:

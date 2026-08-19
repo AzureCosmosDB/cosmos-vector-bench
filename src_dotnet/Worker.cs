@@ -25,7 +25,7 @@ public static class Worker
     /// <summary>Runs one worker over raw UTF-8 document batches using the stream-write hot path.</summary>
     public static async Task RunRawAsync(
         CosmosWriter writer,
-        IAsyncEnumerable<List<byte[]>> batches,
+        IAsyncEnumerable<List<DataSource.RawDocument>> batches,
         WorkerMetrics metrics,
         int maxInFlight,
         CancellationToken cancellationToken)

@@ -9,8 +9,12 @@ param databaseName string
 @description('Name of the container to create or update.')
 param containerName string
 
-@description('Container partition key path.')
-param partitionKeyPath string = '/docid'
+@description('Ordered container partition key paths. Multiple paths create a hierarchical partition key.')
+@minLength(1)
+@maxLength(3)
+param partitionKeyPaths array = [
+  '/docid'
+]
 
 @description('Autoscale maximum RU/s for the database. Azure Cosmos DB autoscale provisions between about 10% of this value and this value, subject to service minimums.')
 @minValue(1000)
@@ -73,10 +77,9 @@ resource container 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/container
     resource: {
       id: containerName
       partitionKey: {
-        paths: [
-          partitionKeyPath
-        ]
-        kind: 'Hash'
+        paths: partitionKeyPaths
+        kind: length(partitionKeyPaths) > 1 ? 'MultiHash' : 'Hash'
+        version: 2
       }
       defaultTtl: defaultTtlSeconds
       indexingPolicy: {

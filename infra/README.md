@@ -48,7 +48,7 @@ The requested scenario knobs are `COSMOS_DATABASE_NAME`, `COSMOS_CONTAINER_NAME`
 | `COSMOS_VECTOR_PATH` | `/emb` | JSON path for the vector field. |
 | `COSMOS_VECTOR_INDEX_TYPE` | `diskANN` | Vector index type: `quantizedFlat` or `diskANN`. |
 | `COSMOS_VECTOR_DIMENSIONS` | `1536` | Vector dimension count. |
-| `COSMOS_PARTITION_KEY_PATH` | `/docid` | Container partition key path. |
+| `COSMOS_PARTITION_KEY_PATHS` | `/docid` | Comma-separated ordered container partition key paths. Use `/sessionid,/docid` for a hierarchical key. |
 | `COSMOS_VECTOR_DATA_TYPE` | `float32` | Vector data type: `float32`, `float16`, `int8`, or `uint8`. |
 | `COSMOS_VECTOR_DISTANCE_FUNCTION` | `cosine` | Distance function: `cosine`, `dotproduct`, or `euclidean`. |
 ## Example: DiskANN Container
@@ -63,7 +63,7 @@ param autoscaleMaxThroughput = 117000
 param vectorPath = '/embedding'
 param vectorIndexType = 'diskANN'
 param vectorDimensions = 1536
-param partitionKeyPath = '/docid'
+param partitionKeyPaths = ['/docid']
 ```
 
 Then provision with `azd`:
@@ -88,7 +88,10 @@ param autoscaleMaxThroughput = 60000
 param vectorPath = '/embedding'
 param vectorIndexType = 'quantizedFlat'
 param vectorDimensions = 1536
-param partitionKeyPath = '/docid'
+param partitionKeyPaths = [
+  '/sessionid'
+  '/docid'
+]
 ```
 
 Then provision with `azd`:
@@ -164,4 +167,4 @@ az group delete `
 
 ## Notes
 
-Use a new or empty container for benchmark runs. The Python writer uses create operations, so rerunning the same input against a populated container creates duplicate-item errors instead of overwriting existing documents.
+Use a new or empty container for benchmark runs. The .NET writer uses create operations, so rerunning the same input against a populated container creates duplicate-item errors instead of overwriting existing documents.

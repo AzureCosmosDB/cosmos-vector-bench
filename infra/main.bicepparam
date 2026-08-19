@@ -4,7 +4,7 @@ param accountName = readEnvironmentVariable('COSMOS_ACCOUNT_NAME')
 param databaseName = readEnvironmentVariable('COSMOS_DATABASE_NAME', 'testdb')
 param containerName = readEnvironmentVariable('COSMOS_CONTAINER_NAME', 'benchmark-openai-vector')
 
-param partitionKeyPath = readEnvironmentVariable('COSMOS_PARTITION_KEY_PATH', '/docid')
+param partitionKeyPaths = split(readEnvironmentVariable('COSMOS_PARTITION_KEY_PATHS', '/docid'), ',')
 param autoscaleMaxThroughput = int(readEnvironmentVariable('COSMOS_AUTOSCALE_MAX_RU', '100000'))
 
 param vectorPath = readEnvironmentVariable('COSMOS_VECTOR_PATH', '/emb')

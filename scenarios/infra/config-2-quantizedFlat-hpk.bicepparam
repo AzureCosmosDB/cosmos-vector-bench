@@ -2,11 +2,14 @@ using '../../infra/main.bicep'
 
 param accountName = '<existing-account-name>'
 param databaseName = 'testdb'
-param containerName = 's2-diskANN'
-param partitionKeyPaths = ['/docid']
-param autoscaleMaxThroughput = 200000
+param containerName = 's2-quantizedFlat-hpk'
+param partitionKeyPaths = [
+  '/sessionid'
+  '/docid'
+]
+param autoscaleMaxThroughput = 100000
 param vectorPath = '/emb'
-param vectorIndexType = 'diskANN'
+param vectorIndexType = 'quantizedFlat'
 param vectorDimensions = 1536
 param vectorDataType = 'float32'
 param vectorDistanceFunction = 'cosine'

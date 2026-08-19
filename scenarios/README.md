@@ -2,7 +2,7 @@
 
 These scenarios benchmark Cosmos DB vector document ingestion with the [ESRally](https://esrally.readthedocs.io/) OpenAI vector corpus.
 
-The run commands below use the Python implementation (`main.py`). Each command has a .NET equivalent that takes the same arguments; see [.NET alternative](#net-alternative).
+The run commands below use the .NET implementation in `src_dotnet/CosmosVectorBench.csproj`.
 
 ## Dataset
 
@@ -22,12 +22,15 @@ Download the `.bz2` file and decompress it once before running scenarios. The be
 | 4 | 10 | 40 | 2.5 | 100 | 1,000 |
 | 5 | 40 | 10 | 0.2 | 2 | 80 |
 | 6 | 50 | 240 | max | — | — |
+| 7 | 75 | 500 | max | — | — |
 
-Scenario 6 is an unthrottled max-throughput run backed by a 1,000,000 RU/s (autoscale max) container, so it has no per-client rate target. With 50 clients at a 240 `bulk_size`, it keeps roughly 12,000 document writes (50 × 240) in flight at once.
+Scenario 6 is an unthrottled max-throughput run backed by a 1,000,000 RU/s (autoscale max) container, so it has no per-client rate target. With 50 clients at a 240 `bulk_size`, it keeps at least 12,000 document writes (50 × 240) in flight at once.
+
+Scenario 7 is an unthrottled max-throughput run backed by a 2,000,000 RU/s (autoscale max) container, so it has no per-client rate target. With 75 clients at a 500 `bulk_size`, it keeps at least 37,500 document writes (75 × 500) in flight at once.
 
 ## One-Time Setup
 
-Create a Python environment and install dependencies. If `COSMOS_KEY` is blank, sign in for `DefaultAzureCredential` authentication.
+Install the [.NET 9 SDK](https://dotnet.microsoft.com/download). The dataset download utility uses Python, so create a Python environment and install its dependencies as well. If `COSMOS_KEY` is blank, sign in for `DefaultAzureCredential` authentication.
 
 Windows PowerShell:
 
@@ -47,7 +50,7 @@ python -m pip install -r requirements.txt
 az login
 ```
 
-To run the scenarios with the .NET implementation instead, install the [.NET 9 SDK](https://dotnet.microsoft.com/download), sign in with `az login` when `COSMOS_KEY` is blank, and build the project:
+Build the .NET benchmark project:
 
 ```powershell
 dotnet build .\src_dotnet\CosmosVectorBench.csproj -c Release
@@ -134,7 +137,11 @@ DATA_TYPE=file
 DOC_JSON_PATH=./data/open_ai_corpus-initial-indexing.json
 DOC_JSON_FORMAT=jsonl
 
-PARTITION_KEY_FIELD=docid
+PARTITION_KEY_FIELDS=docid
+DOCUMENT_ID_FALLBACK_FIELD=docid
+SESSION_ID_ENABLED=false
+SESSION_ID_MIN_DOCS=10
+SESSION_ID_MAX_DOCS=1000
 DOC_QUEUE_MULTIPLIER=30
 MAX_CONCURRENCY=30
 COSMOS_ERROR_SAMPLE_LIMIT=0
@@ -149,7 +156,7 @@ Set the existing Cosmos DB account name before provisioning. You can either pass
 param accountName = '<existing-account-name>'
 ```
 
-Replace it with your account name in the `config-*-quantizedFlat.bicepparam` or `config-*-diskANN.bicepparam` files you plan to deploy, or set/pass `accountName` when running a helper script.
+Replace it with your account name in the `config-*-quantizedFlat*.bicepparam` or `config-*-diskANN.bicepparam` files you plan to deploy, or set/pass `accountName` when running a helper script.
 
 Download and decompress the source file. This is the recommended scenario setup because compressed input can limit app-side throughput during benchmark runs:
 
@@ -174,7 +181,15 @@ DOC_JSON_PATH=./data/open_ai_corpus-initial-indexing.json
 
 ## Run Commands
 
-Each scenario has two matching Bicep parameter files under `scenarios/infra/`: one for `quantizedFlat` and one for `DiskANN`. The examples below show the `quantizedFlat` flow only. To run the same scenario with `DiskANN`, use the matching `config-*-diskANN.bicepparam` file and container name instead.
+Each scenario has one `DiskANN` parameter file and three `quantizedFlat` partition-key variants under `scenarios/infra/`:
+
+| Mode | Parameter file suffix | Container suffix | Runtime fields |
+|---|---|---|---|
+| `docid` | `quantizedFlat-docid.bicepparam` | `quantizedFlat` | `docid` |
+| `sessionid` | `quantizedFlat-sessionid.bicepparam` | `quantizedFlat-sessionid` | `sessionid` |
+| `hpk` | `quantizedFlat-hpk.bicepparam` | `quantizedFlat-hpk` | `sessionid,docid` |
+
+The client defaults to process or `.env` configuration, which is `docid` in the repository setup. Passing `--partition-key-mode` selects the fields and enables generated `sessionid` values when required. The examples below show the original `docid` quantizedFlat flow. DiskANN continues to use its matching `config-*-diskANN.bicepparam` file and container name.
 
 Before provisioning, edit the selected `.bicepparam` file and set `accountName` to your existing Cosmos DB account name. For manual deployments, use the scenario-specific files in `scenarios/infra/`, not the generic `infra/main.bicepparam`. The commands below create the matching container, point the benchmark process at that container, read the decompressed `.json` file, and write final metrics to `results/` when `CSV_OUTPUT_ENABLED=true`.
 
@@ -190,6 +205,8 @@ $env:accountName = '<cosmos-account-name>'
 # $accountName = '<cosmos-account-name>'
 
 .\scenarios\run-openai.ps1
+.\scenarios\run-openai.ps1 -PartitionKeyMode sessionid
+.\scenarios\run-openai.ps1 -PartitionKeyMode hpk
 .\scenarios\run-openai.ps1 -IndexType diskANN
 # .\scenarios\run-openai.ps1 -IndexType diskANN -ResourceGroup '<account-resource-group-name>' -AccountName '<cosmos-account-name>'
 ```
@@ -202,6 +219,8 @@ export resourceGroup='<account-resource-group-name>'
 export accountName='<cosmos-account-name>'
 
 bash ./scenarios/run-openai.sh
+bash ./scenarios/run-openai.sh --partition-key-mode sessionid
+bash ./scenarios/run-openai.sh --partition-key-mode hpk
 bash ./scenarios/run-openai.sh --index-type diskANN
 # bash ./scenarios/run-openai.sh --index-type diskANN --resource-group '<account-resource-group-name>' --account-name '<cosmos-account-name>'
 ```
@@ -213,8 +232,8 @@ Windows PowerShell:
 ```powershell
 $resourceGroup = '<account-resource-group-name>'
 
-az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-1-quantizedFlat.bicepparam
-.\.venv\Scripts\python.exe .\main.py --bulk-size 18 --num-clients 10 --total-docs 180000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s1-quantizedFlat
+az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-1-quantizedFlat-docid.bicepparam
+dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 18 --num-clients 10 --total-docs 180000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s1-quantizedFlat
 ```
 
 macOS/Linux:
@@ -222,8 +241,8 @@ macOS/Linux:
 ```bash
 resourceGroup='<account-resource-group-name>'
 
-az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-1-quantizedFlat.bicepparam
-./.venv/bin/python ./main.py --bulk-size 18 --num-clients 10 --total-docs 180000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s1-quantizedFlat
+az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-1-quantizedFlat-docid.bicepparam
+dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 18 --num-clients 10 --total-docs 180000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s1-quantizedFlat
 ```
 
 ### Config 2
@@ -233,8 +252,8 @@ Windows PowerShell:
 ```powershell
 $resourceGroup = '<account-resource-group-name>'
 
-az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-2-quantizedFlat.bicepparam
-.\.venv\Scripts\python.exe .\main.py --bulk-size 20 --num-clients 20 --total-docs 300000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s2-quantizedFlat
+az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-2-quantizedFlat-docid.bicepparam
+dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 20 --num-clients 20 --total-docs 300000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s2-quantizedFlat
 ```
 
 macOS/Linux:
@@ -242,8 +261,8 @@ macOS/Linux:
 ```bash
 resourceGroup='<account-resource-group-name>'
 
-az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-2-quantizedFlat.bicepparam
-./.venv/bin/python ./main.py --bulk-size 20 --num-clients 20 --total-docs 300000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s2-quantizedFlat
+az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-2-quantizedFlat-docid.bicepparam
+dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 20 --num-clients 20 --total-docs 300000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s2-quantizedFlat
 ```
 
 ### Config 3
@@ -253,8 +272,8 @@ Windows PowerShell:
 ```powershell
 $resourceGroup = '<account-resource-group-name>'
 
-az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-3-quantizedFlat.bicepparam
-.\.venv\Scripts\python.exe .\main.py --bulk-size 30 --num-clients 30 --total-docs 1200000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s3-quantizedFlat
+az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-3-quantizedFlat-docid.bicepparam
+dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 30 --num-clients 30 --total-docs 1200000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s3-quantizedFlat
 ```
 
 macOS/Linux:
@@ -262,8 +281,8 @@ macOS/Linux:
 ```bash
 resourceGroup='<account-resource-group-name>'
 
-az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-3-quantizedFlat.bicepparam
-./.venv/bin/python ./main.py --bulk-size 30 --num-clients 30 --total-docs 1200000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s3-quantizedFlat
+az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-3-quantizedFlat-docid.bicepparam
+dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 30 --num-clients 30 --total-docs 1200000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s3-quantizedFlat
 ```
 
 ### Config 4
@@ -273,8 +292,8 @@ Windows PowerShell:
 ```powershell
 $resourceGroup = '<account-resource-group-name>'
 
-az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-4-quantizedFlat.bicepparam
-.\.venv\Scripts\python.exe .\main.py --bulk-size 40 --num-clients 10 --total-docs 400000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s4-quantizedFlat
+az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-4-quantizedFlat-docid.bicepparam
+dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 40 --num-clients 10 --total-docs 400000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s4-quantizedFlat
 ```
 
 macOS/Linux:
@@ -282,8 +301,8 @@ macOS/Linux:
 ```bash
 resourceGroup='<account-resource-group-name>'
 
-az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-4-quantizedFlat.bicepparam
-./.venv/bin/python ./main.py --bulk-size 40 --num-clients 10 --total-docs 400000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s4-quantizedFlat
+az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-4-quantizedFlat-docid.bicepparam
+dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 40 --num-clients 10 --total-docs 400000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s4-quantizedFlat
 ```
 
 ### Config 5
@@ -293,8 +312,8 @@ Windows PowerShell:
 ```powershell
 $resourceGroup = '<account-resource-group-name>'
 
-az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-5-quantizedFlat.bicepparam
-.\.venv\Scripts\python.exe .\main.py --bulk-size 10 --num-clients 40 --total-docs 90000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s5-quantizedFlat
+az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-5-quantizedFlat-docid.bicepparam
+dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 10 --num-clients 40 --total-docs 90000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s5-quantizedFlat
 ```
 
 macOS/Linux:
@@ -302,8 +321,8 @@ macOS/Linux:
 ```bash
 resourceGroup='<account-resource-group-name>'
 
-az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-5-quantizedFlat.bicepparam
-./.venv/bin/python ./main.py --bulk-size 10 --num-clients 40 --total-docs 90000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s5-quantizedFlat
+az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-5-quantizedFlat-docid.bicepparam
+dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 10 --num-clients 40 --total-docs 90000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s5-quantizedFlat
 ```
 
 ### Config 6
@@ -313,8 +332,8 @@ Windows PowerShell:
 ```powershell
 $resourceGroup = '<account-resource-group-name>'
 
-az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-6-quantizedFlat.bicepparam
-.\.venv\Scripts\python.exe .\main.py --bulk-size 240 --num-clients 50 --total-docs 2000000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s6-quantizedFlat
+az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-6-quantizedFlat-docid.bicepparam
+dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 240 --num-clients 50 --total-docs 2000000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s6-quantizedFlat
 ```
 
 macOS/Linux:
@@ -322,37 +341,101 @@ macOS/Linux:
 ```bash
 resourceGroup='<account-resource-group-name>'
 
-az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-6-quantizedFlat.bicepparam
-./.venv/bin/python ./main.py --bulk-size 240 --num-clients 50 --total-docs 2000000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s6-quantizedFlat
+az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-6-quantizedFlat-docid.bicepparam
+dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 240 --num-clients 50 --total-docs 2000000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s6-quantizedFlat
 ```
 
-### .NET alternative
+### Config 7
 
-Every scenario run command above has a .NET equivalent. Provision the container with the same `az deployment group create` command, then replace the `python ./main.py ...` invocation with the .NET project, passing the same arguments after `--`. Provisioning, container names, configs, and the decompressed dataset are identical; only the benchmark client changes.
+Config 7 can be run against three quantizedFlat containers to compare partition distribution under the same 75-client, 500-document bulk, 2,000,000-document workload. Provision and test one container at a time unless you intend to keep multiple 2,000,000 RU/s autoscale-max containers. Delete each test container when its run is complete.
 
-The .NET implementation uses the native Cosmos SDK `AllowBulkExecution` write path and in-process logical clients. It reads the decompressed `.json` file only (`.bz2` input is not supported).
-
-For example, Config 1 with the .NET client:
+#### Config 7 with `/docid`
 
 Windows PowerShell:
 
 ```powershell
 $resourceGroup = '<account-resource-group-name>'
+$accountName = '<cosmos-account-name>'
 
-az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-1-quantizedFlat.bicepparam
-dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 18 --num-clients 10 --total-docs 180000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s1-quantizedFlat
+az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-7-quantizedFlat-docid.bicepparam
+dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 500 --num-clients 75 --total-docs 2000000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s7-quantizedFlat --partition-key-mode docid
 ```
 
 macOS/Linux:
 
 ```bash
 resourceGroup='<account-resource-group-name>'
+accountName='<cosmos-account-name>'
 
-az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-1-quantizedFlat.bicepparam
-dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 18 --num-clients 10 --total-docs 180000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s1-quantizedFlat
+az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-7-quantizedFlat-docid.bicepparam
+dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 500 --num-clients 75 --total-docs 2000000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s7-quantizedFlat --partition-key-mode docid
 ```
 
-For Configs 2-6, keep the same `--bulk-size`, `--num-clients`, `--total-docs`, and `--container-name` values shown in each scenario above and the matching `.bicepparam` file.
+#### Config 7 with `/sessionid`
+
+Windows PowerShell:
+
+```powershell
+$resourceGroup = '<account-resource-group-name>'
+$accountName = '<cosmos-account-name>'
+
+az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-7-quantizedFlat-sessionid.bicepparam
+dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 500 --num-clients 75 --total-docs 2000000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s7-quantizedFlat-sessionid --partition-key-mode sessionid
+```
+
+macOS/Linux:
+
+```bash
+resourceGroup='<account-resource-group-name>'
+accountName='<cosmos-account-name>'
+
+az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-7-quantizedFlat-sessionid.bicepparam
+dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 500 --num-clients 75 --total-docs 2000000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s7-quantizedFlat-sessionid --partition-key-mode sessionid
+```
+
+#### Config 7 with hierarchical `/sessionid`, `/docid`
+
+Windows PowerShell:
+
+```powershell
+$resourceGroup = '<account-resource-group-name>'
+$accountName = '<cosmos-account-name>'
+
+az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-7-quantizedFlat-hpk.bicepparam
+dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 500 --num-clients 75 --total-docs 2000000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s7-quantizedFlat-hpk --partition-key-mode hpk
+```
+
+macOS/Linux:
+
+```bash
+resourceGroup='<account-resource-group-name>'
+accountName='<cosmos-account-name>'
+
+az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-7-quantizedFlat-hpk.bicepparam
+dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 500 --num-clients 75 --total-docs 2000000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s7-quantizedFlat-hpk --partition-key-mode hpk
+```
+
+#### Config 7 vector search in HPK mode
+
+After populating the Config 7 hierarchical `/sessionid`, `/docid` container, use `--search --partition-key-mode hpk` to run HPK-scoped vector queries without inserting documents. The benchmark samples 100 `sessionid` values and passes each selected value as an HPK prefix through `QueryRequestOptions.PartitionKey`. Warmup is enabled by default to prime a brand-new Cosmos DB container for vector search before measurement; it runs 1,000 untimed queries before collecting search statistics. This priming is not needed for a steady-state production container, so add `--warmup false` to skip it. The measured workload defaults to one query/sec per client and 1,000 total queries unless overridden.
+
+Windows PowerShell:
+
+```powershell
+dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --search --partition-key-mode hpk --container-name s7-quantizedFlat-hpk --num-clients 100 --queries-per-second 1 --total-queries 10000
+```
+
+macOS/Linux:
+
+```bash
+dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --search --partition-key-mode hpk --container-name s7-quantizedFlat-hpk --num-clients 100 --queries-per-second 1 --total-queries 10000
+```
+
+To compare scalar partition keys, run the same search against `s7-quantizedFlat` with `--partition-key-mode docid`, or against `s7-quantizedFlat-sessionid` with `--partition-key-mode sessionid`.
+
+The vector query is `TOP 10` ordered by `VectorDistance`, has no `WHERE` clause, and passes the selected value through `QueryRequestOptions.PartitionKey`. For `hpk` mode, Microsoft guidance notes that also placing the prefix in `WHERE` guarantees efficient routing; this benchmark intentionally omits that clause, so use the reported RU and diagnostics to verify routing behavior for the target account.
+
+The .NET implementation uses the native Cosmos SDK `AllowBulkExecution` write path and in-process logical clients. It reads the decompressed `.json` file only (`.bz2` input is not supported).
 
 ## Reading Results
 
@@ -420,7 +503,7 @@ for scenario in 1 2 3 4 5; do
 done
 ```
 
-For a single scenario container created from an individual Bicep parameter file, delete the matching container name from that file. For example, `config-3-quantizedFlat.bicepparam` creates `s3-quantizedFlat`:
+For a single scenario container created from an individual Bicep parameter file, delete the matching container name from that file. For example, `config-3-quantizedFlat-docid.bicepparam` creates `s3-quantizedFlat`:
 
 ```powershell
 az cosmosdb sql container delete `

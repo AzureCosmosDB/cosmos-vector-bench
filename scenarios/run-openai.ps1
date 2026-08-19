@@ -3,6 +3,9 @@ param(
     [ValidateSet('quantizedFlat', 'quantizedflat', 'diskANN', 'diskann')]
     [string]$IndexType = 'quantizedFlat',
 
+    [ValidateSet('hpk', 'docid', 'sessionid')]
+    [string]$PartitionKeyMode = 'docid',
+
     [string]$ResourceGroup = $env:resourceGroup,
 
     [string]$AccountName = $env:accountName
@@ -30,10 +33,24 @@ if (-not $AccountName) {
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $normalizedIndexType = if ($IndexType -ieq 'diskANN') { 'diskANN' } else { 'quantizedFlat' }
-$pythonExe = Join-Path $repoRoot '.venv\Scripts\python.exe'
-if (-not (Test-Path $pythonExe)) {
-    $pythonExe = 'python'
+if ($normalizedIndexType -eq 'diskANN' -and $PartitionKeyMode -ne 'docid') {
+    throw 'hpk and sessionid partition-key variants are available for quantizedFlat only.'
 }
+
+$variantSuffix = switch ($PartitionKeyMode) {
+    'hpk' { '-hpk' }
+    'sessionid' { '-sessionid' }
+    default { '-docid' }
+}
+if ($normalizedIndexType -eq 'diskANN') {
+    $variantSuffix = ''
+}
+$containerSuffix = switch ($PartitionKeyMode) {
+    'hpk' { '-hpk' }
+    'sessionid' { '-sessionid' }
+    default { '' }
+}
+$projectPath = '.\src_dotnet\CosmosVectorBench.csproj'
 
 $scenarios = @(
     @{ Config = 1; BulkSize = 18; NumClients = 10; TotalDocs = 180000 },
@@ -47,8 +64,8 @@ Push-Location $repoRoot
 try {
     foreach ($scenario in $scenarios) {
         $config = $scenario.Config
-        $paramFile = ".\scenarios\infra\config-$config-$normalizedIndexType.bicepparam"
-        $containerName = "s$config-$normalizedIndexType"
+        $paramFile = ".\scenarios\infra\config-$config-$normalizedIndexType$variantSuffix.bicepparam"
+        $containerName = "s$config-$normalizedIndexType$containerSuffix"
 
         Write-Host ""
         Write-Host "=== OpenAI config $config ($normalizedIndexType) ==="
@@ -63,12 +80,13 @@ try {
         }
 
         Write-Host "Running benchmark against $containerName"
-        & $pythonExe .\main.py `
+        dotnet run --project $projectPath -c Release -- `
             --bulk-size $scenario['BulkSize'] `
             --num-clients $scenario['NumClients'] `
             --total-docs $scenario['TotalDocs'] `
-            --data-path .\data\open_ai_corpus-initial-indexing.json.bz2 `
-            --container-name $containerName
+            --data-path .\data\open_ai_corpus-initial-indexing.json `
+            --container-name $containerName `
+            --partition-key-mode $PartitionKeyMode
 
         if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE

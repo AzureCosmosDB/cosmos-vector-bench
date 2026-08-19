@@ -12,7 +12,16 @@ import traceback
 from os import urandom
 from pathlib import Path
 
-from config import DOC_JSON_FORMAT, FAKE_DATA_VECTOR_DIM, PARTITION_KEY_FIELD, READ_BATCH_SIZE
+from config import (
+    DOCUMENT_ID_FALLBACK_FIELD,
+    DOC_JSON_FORMAT,
+    FAKE_DATA_VECTOR_DIM,
+    PARTITION_KEY_FIELDS,
+    READ_BATCH_SIZE,
+    SESSION_ID_ENABLED,
+    SESSION_ID_MAX_DOCS,
+    SESSION_ID_MIN_DOCS,
+)
 
 try:
     import ijson
@@ -28,25 +37,55 @@ def _new_guid_id(_urandom=urandom) -> str:
     return f"{value[:8]}-{value[8:12]}-{value[12:16]}-{value[16:20]}-{value[20:]}"
 
 
-def make_doc(i: int, payload: str) -> dict:
+class SessionIdAssigner:
+    """Assign one random session id to a bounded run of consecutive documents."""
+
+    __slots__ = ("_enabled", "_max_docs", "_min_docs", "_remaining", "_session_id")
+
+    def __init__(
+        self,
+        enabled: bool = SESSION_ID_ENABLED,
+        min_docs: int = SESSION_ID_MIN_DOCS,
+        max_docs: int = SESSION_ID_MAX_DOCS,
+    ) -> None:
+        self._enabled = enabled
+        self._min_docs = min_docs
+        self._max_docs = max_docs
+        self._remaining = 0
+        self._session_id = ""
+
+    def add_to(self, doc: dict) -> dict:
+        if not self._enabled:
+            return doc
+        if self._remaining == 0:
+            self._session_id = _new_guid_id()
+            self._remaining = random.randint(self._min_docs, self._max_docs)
+        doc["sessionid"] = self._session_id
+        self._remaining -= 1
+        return doc
+
+
+def make_doc(i: int, payload: str, session_ids: SessionIdAssigner | None = None) -> dict:
     """Create one synthetic benchmark document.
 
     This is used in fake-data mode when the benchmark needs to exercise Cosmos writes without reading a source corpus.
     Each generated document has a unique id, a GUID ``docid`` partition key, a title, a text payload, and a randomly
     generated ``emb`` embedding vector of ``FAKE_DATA_VECTOR_DIM`` floats in [-1, 1].
     """
-    return {
+    doc = {
         "id": _new_guid_id(),
         "docid": _new_guid_id(),
         "title": f"Document {i}",
         "text": payload,
         "emb": [round(random.uniform(-1.0, 1.0), 8) for _ in range(FAKE_DATA_VECTOR_DIM)],
     }
+    return session_ids.add_to(doc) if session_ids is not None else doc
 
 
 def _prepare_loaded_doc(
     doc: object,
     record_number: int,
+    session_ids: SessionIdAssigner | None = None,
 ) -> dict:
     """Validate a loaded source record and ensure it has a Cosmos id.
 
@@ -57,22 +96,31 @@ def _prepare_loaded_doc(
     if not isinstance(doc, dict):
         raise ValueError(f"Loaded record {record_number} is {type(doc).__name__}, expected a JSON object")
 
-    if PARTITION_KEY_FIELD not in doc or doc[PARTITION_KEY_FIELD] is None or doc[PARTITION_KEY_FIELD] == "":
+    prepared = doc
+    if session_ids is not None:
+        session_ids.add_to(prepared)
+
+    missing_fields = [
+        field for field in PARTITION_KEY_FIELDS
+        if field not in prepared or prepared[field] is None or prepared[field] == ""
+    ]
+    if missing_fields:
         raise ValueError(
-            f"Loaded record {record_number} is missing required partition key field {PARTITION_KEY_FIELD!r}. "
-            f"Available fields: {', '.join(sorted(str(key) for key in doc.keys())[:20])}"
+            f"Loaded record {record_number} is missing required partition key field(s) {missing_fields!r}. "
+            f"Available fields: {', '.join(sorted(str(key) for key in prepared.keys())[:20])}"
         )
 
-    prepared = doc
     if "id" in prepared and prepared["id"]:
         if isinstance(prepared["id"], str):
             return prepared
-        prepared = dict(prepared)
         prepared["id"] = str(prepared["id"])
         return prepared
 
-    prepared = dict(prepared)
-    prepared["id"] = str(prepared[PARTITION_KEY_FIELD])
+    if DOCUMENT_ID_FALLBACK_FIELD not in prepared or prepared[DOCUMENT_ID_FALLBACK_FIELD] in (None, ""):
+        raise ValueError(
+            f"Loaded record {record_number} is missing id and fallback field {DOCUMENT_ID_FALLBACK_FIELD!r}"
+        )
+    prepared["id"] = str(prepared[DOCUMENT_ID_FALLBACK_FIELD])
     return prepared
 
 
@@ -83,9 +131,10 @@ async def _iter_generated_doc_bulks(start_i: int, end_i: int, bulk_size: int, pa
     This wrapper adapts the fake-data generator to that interface without adding sleeps or extra buffering.
     It lets fake and file modes share the same `run_worker_with_batches` implementation.
     """
+    session_ids = SessionIdAssigner()
     for bulk_start in range(start_i, end_i, bulk_size):
         bulk_end = min(bulk_start + bulk_size, end_i)
-        yield [make_doc(i, payload) for i in range(bulk_start, bulk_end)]
+        yield [make_doc(i, payload, session_ids) for i in range(bulk_start, bulk_end)]
 
 
 async def _iter_queue_doc_bulks(work_queue: mp.Queue, bulk_size: int):
@@ -142,6 +191,7 @@ def stream_json_docs(filepath: str, work_queue: mp.Queue, worker_count: int, sta
 
     docs_read = 0
     pending_docs = []
+    session_ids = SessionIdAssigner()
     started = time.perf_counter()
     if status is not None:
         status["docs_read"] = 0
@@ -171,7 +221,7 @@ def stream_json_docs(filepath: str, work_queue: mp.Queue, worker_count: int, sta
                         doc = json.loads(raw)
                     except json.JSONDecodeError as exc:
                         raise ValueError(f"Invalid JSONL record at line {line_number}: {exc}") from exc
-                    enqueue_doc(_prepare_loaded_doc(doc, line_number))
+                    enqueue_doc(_prepare_loaded_doc(doc, line_number, session_ids))
                     docs_read += 1
                     if status is not None and docs_read % 1000 == 0:
                         status["docs_read"] = docs_read
@@ -179,7 +229,7 @@ def stream_json_docs(filepath: str, work_queue: mp.Queue, worker_count: int, sta
                         break
             elif DOC_JSON_FORMAT == "multiple_values":
                 for doc in ijson.items(stream, "", multiple_values=True):
-                    enqueue_doc(_prepare_loaded_doc(doc, docs_read + 1))
+                    enqueue_doc(_prepare_loaded_doc(doc, docs_read + 1, session_ids))
                     docs_read += 1
                     if status is not None and docs_read % 1000 == 0:
                         status["docs_read"] = docs_read
@@ -187,7 +237,7 @@ def stream_json_docs(filepath: str, work_queue: mp.Queue, worker_count: int, sta
                         break
             else:
                 for doc in ijson.items(stream, "item"):
-                    enqueue_doc(_prepare_loaded_doc(doc, docs_read + 1))
+                    enqueue_doc(_prepare_loaded_doc(doc, docs_read + 1, session_ids))
                     docs_read += 1
                     if status is not None and docs_read % 1000 == 0:
                         status["docs_read"] = docs_read

@@ -10,6 +10,8 @@ namespace CosmosVectorBench;
 /// </summary>
 public sealed class BenchmarkConfig
 {
+    public const int SearchWarmupQueryCount = 1000;
+
     public string Endpoint { get; private init; } = "";
     public string Database { get; private init; } = "";
     public string Container { get; private init; } = "";
@@ -29,6 +31,15 @@ public sealed class BenchmarkConfig
     public bool PartitionKeyRangeRpsEnabled { get; private init; }
     public int PayloadBytes { get; private init; }
     public int FakeDataVectorDim { get; private init; }
+    public bool SessionIdEnabled { get; private init; }
+    public int SessionIdMinDocs { get; private init; }
+    public int SessionIdMaxDocs { get; private init; }
+    public bool SearchEnabled { get; private init; }
+    public bool SearchWarmupEnabled { get; private init; }
+    public int SearchQueriesPerSecond { get; private init; }
+    public int SearchTotalQueries { get; private init; }
+    public string CosmosVectorPath { get; private init; } = "/emb";
+    public int CosmosVectorDimensions { get; private init; }
 
     public double LiveIntervalSec { get; private init; }
     public double MetricsSampleIntervalSec { get; private init; }
@@ -41,6 +52,8 @@ public sealed class BenchmarkConfig
     public int ReadBatchSize { get; private init; }
     public int DocQueueMultiplier { get; private init; }
     public string PartitionKeyField { get; private init; } = "";
+    public IReadOnlyList<string> PartitionKeyFields { get; private init; } = [];
+    public string DocumentIdFallbackField { get; private init; } = "docid";
     public int CosmosErrorSampleLimit { get; private init; }
 
     public int EffectiveTotalDocs { get; private init; }
@@ -88,9 +101,19 @@ public sealed class BenchmarkConfig
         string docJsonPath = (GetEnv("DOC_JSON_PATH") ?? GetEnv("DATA_FILE_PATH") ?? "./data/open_ai_corpus-initial-indexing.json").Trim();
         string docJsonFormat = (GetEnv("DOC_JSON_FORMAT") ?? "jsonl").Trim().ToLowerInvariant();
         string partitionKeyField = (GetEnv("PARTITION_KEY_FIELD") ?? "").Trim();
+        string[] partitionKeyFields = (GetEnv("PARTITION_KEY_FIELDS") ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(field => field.TrimStart('/'))
+            .Where(field => field.Length > 0)
+            .ToArray();
+        if (partitionKeyFields.Length == 0 && partitionKeyField.Length > 0)
+        {
+            partitionKeyFields = [partitionKeyField.TrimStart('/')];
+        }
 
         int effectiveTotalDocs = maxTotalDocs.HasValue ? Math.Min(totalDocs, maxTotalDocs.Value) : totalDocs;
         double liveInterval = FloatEnv("LIVE_INTERVAL_SEC", 1.0, 0.1);
+        bool searchEnabled = BoolEnv("SEARCH_ENABLED", false);
 
         var config = new BenchmarkConfig
         {
@@ -113,6 +136,15 @@ public sealed class BenchmarkConfig
             PartitionKeyRangeRpsEnabled = BoolEnv("PARTITION_KEY_RANGE_RPS_ENABLED", false),
             PayloadBytes = IntEnv("PAYLOAD_BYTES", 5000, 0),
             FakeDataVectorDim = IntEnv("FAKE_DATA_VECTOR_DIM", 1536, 0),
+            SessionIdEnabled = BoolEnv("SESSION_ID_ENABLED", false),
+            SessionIdMinDocs = IntEnv("SESSION_ID_MIN_DOCS", 10, 1),
+            SessionIdMaxDocs = IntEnv("SESSION_ID_MAX_DOCS", 1000, 1),
+            SearchEnabled = searchEnabled,
+            SearchWarmupEnabled = searchEnabled ? BoolEnv("SEARCH_WARMUP_ENABLED", true) : true,
+            SearchQueriesPerSecond = searchEnabled ? IntEnv("SEARCH_QUERIES_PER_SECOND", 1, 1) : 1,
+            SearchTotalQueries = searchEnabled ? IntEnv("SEARCH_TOTAL_QUERIES", 1000, 1) : 1000,
+            CosmosVectorPath = (GetEnv("COSMOS_VECTOR_PATH") ?? "/emb").Trim(),
+            CosmosVectorDimensions = searchEnabled ? IntEnv("COSMOS_VECTOR_DIMENSIONS", 1536, 1) : 1536,
             LiveIntervalSec = liveInterval,
             MetricsSampleIntervalSec = FloatEnv("METRICS_SAMPLE_INTERVAL_SEC", liveInterval, 0.1),
             MetricsTimingSampleInterval = IntEnv("METRICS_TIMING_SAMPLE_INTERVAL", 1),
@@ -123,6 +155,8 @@ public sealed class BenchmarkConfig
             ReadBatchSize = IntEnv("READ_BATCH_SIZE", bulkSize),
             DocQueueMultiplier = IntEnv("DOC_QUEUE_MULTIPLIER", 4),
             PartitionKeyField = partitionKeyField,
+            PartitionKeyFields = partitionKeyFields,
+            DocumentIdFallbackField = (GetEnv("DOCUMENT_ID_FALLBACK_FIELD") ?? (partitionKeyField.Length > 0 ? partitionKeyField : "docid")).Trim().TrimStart('/'),
             CosmosErrorSampleLimit = IntEnv("COSMOS_ERROR_SAMPLE_LIMIT", 3, 0),
             EffectiveTotalDocs = effectiveTotalDocs,
             CsvOutputEnabled = BoolEnv("CSV_OUTPUT_ENABLED", true),
@@ -141,19 +175,63 @@ public sealed class BenchmarkConfig
             throw new InvalidOperationException("DATA_TYPE must be one of: fake, file");
         }
 
+        if (SessionIdMaxDocs < SessionIdMinDocs)
+        {
+            throw new InvalidOperationException("SESSION_ID_MAX_DOCS must be greater than or equal to SESSION_ID_MIN_DOCS");
+        }
+
+        if (SearchQueriesPerSecond > 100)
+        {
+            throw new InvalidOperationException("SEARCH_QUERIES_PER_SECOND must be between 1 and 100");
+        }
+
+        if (SearchEnabled && !BoolEnv("PARTITION_KEY_MODE_EXPLICIT", false))
+        {
+            throw new InvalidOperationException("Search mode requires an explicit --partition-key-mode argument");
+        }
+
+        if (SearchEnabled && PartitionKeyFields.Count == 0)
+        {
+            throw new InvalidOperationException("Search mode requires partition-key fields");
+        }
+
+        if (SearchEnabled)
+        {
+            ValidateVectorPath(CosmosVectorPath);
+        }
+
         if (DataType == "file" && string.IsNullOrEmpty(DocJsonPath))
         {
             throw new InvalidOperationException("DOC_JSON_PATH is required when DATA_TYPE=file");
         }
 
-        if (DataType == "file" && string.IsNullOrEmpty(PartitionKeyField))
+        if (DataType == "file" && PartitionKeyFields.Count == 0)
         {
-            throw new InvalidOperationException("PARTITION_KEY_FIELD is required when DATA_TYPE=file");
+            throw new InvalidOperationException("PARTITION_KEY_FIELDS or PARTITION_KEY_FIELD is required when DATA_TYPE=file");
+        }
+
+        if (string.IsNullOrEmpty(DocumentIdFallbackField))
+        {
+            throw new InvalidOperationException("DOCUMENT_ID_FALLBACK_FIELD must not be empty");
         }
 
         if (DocJsonFormat is not ("array" or "jsonl" or "multiple_values"))
         {
             throw new InvalidOperationException("DOC_JSON_FORMAT must be one of: array, jsonl, multiple_values");
+        }
+    }
+
+    private static void ValidateVectorPath(string path)
+    {
+        if (!path.StartsWith('/') || path.Length < 2)
+        {
+            throw new InvalidOperationException("COSMOS_VECTOR_PATH must start with '/' and name at least one property");
+        }
+
+        string[] segments = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Any(segment => segment.Any(character => !char.IsLetterOrDigit(character) && character is not ('_' or '-'))))
+        {
+            throw new InvalidOperationException("COSMOS_VECTOR_PATH segments may contain only letters, digits, '_' and '-'");
         }
     }
 

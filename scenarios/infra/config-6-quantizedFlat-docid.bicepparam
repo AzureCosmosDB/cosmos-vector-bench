@@ -1,12 +1,12 @@
 using '../../infra/main.bicep'
 
-param accountName = '<existing-account-name>'
+param accountName = 'cosmos-tests'
 param databaseName = 'testdb'
-param containerName = 's2-diskANN'
+param containerName = 's6-quantizedFlat'
 param partitionKeyPaths = ['/docid']
-param autoscaleMaxThroughput = 200000
+param autoscaleMaxThroughput = 1000000
 param vectorPath = '/emb'
-param vectorIndexType = 'diskANN'
+param vectorIndexType = 'quantizedFlat'
 param vectorDimensions = 1536
 param vectorDataType = 'float32'
 param vectorDistanceFunction = 'cosine'

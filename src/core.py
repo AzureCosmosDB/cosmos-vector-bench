@@ -38,7 +38,7 @@ from config import (
     MAX_TOTAL_DOCS,
     METRICS_SAMPLE_INTERVAL_SEC,
     PARTITION_KEY_RANGE_RPS_ENABLED,
-    PARTITION_KEY_FIELD,
+    PARTITION_KEY_FIELDS,
     PAYLOAD_BYTES,
     READ_BATCH_SIZE,
 )
@@ -348,7 +348,7 @@ def _print_cosmos_error_sample(exc: exceptions.CosmosHttpResponseError, doc: dic
     response = getattr(exc, "response", None)
     internal_response = getattr(response, "internal_response", None)
     headers = getattr(exc, "headers", None) or getattr(response, "headers", None) or getattr(internal_response, "headers", None)
-    partition_value = doc.get(PARTITION_KEY_FIELD) if PARTITION_KEY_FIELD else None
+    partition_value = {field: doc.get(field) for field in PARTITION_KEY_FIELDS}
     print("\n[cosmos error sample]", flush=True)
     print(f"worker={metrics.get('worker_index')}", flush=True)
     print(f"status={getattr(exc, 'status_code', None)}", flush=True)
@@ -356,7 +356,7 @@ def _print_cosmos_error_sample(exc: exceptions.CosmosHttpResponseError, doc: dic
     print(f"reason={getattr(exc, 'reason', None)!r}", flush=True)
     print(f"message={getattr(exc, 'message', None)!r}", flush=True)
     print(f"id={doc.get('id')!r}", flush=True)
-    print(f"partition_key_field={PARTITION_KEY_FIELD!r}", flush=True)
+    print(f"partition_key_fields={PARTITION_KEY_FIELDS!r}", flush=True)
     print(f"partition_key_value={partition_value!r}", flush=True)
     print(f"request_charge={_request_charge_from_headers(headers):.2f}", flush=True)
     print(f"headers={_safe_json_preview(_headers_preview(headers), max_chars=3000)}", flush=True)

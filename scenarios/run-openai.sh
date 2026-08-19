@@ -2,10 +2,11 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 [--index-type quantizedFlat|diskANN] [--resource-group name] [--account-name name]" >&2
+  echo "Usage: $0 [--index-type quantizedFlat|diskANN] [--partition-key-mode hpk|docid|sessionid] [--resource-group name] [--account-name name]" >&2
 }
 
 index_type="quantizedFlat"
+partition_key_mode="docid"
 resource_group="${resourceGroup:-}"
 account_name="${accountName:-}"
 
@@ -25,6 +26,14 @@ while [[ $# -gt 0 ]]; do
         exit 2
       fi
       resource_group="$2"
+      shift 2
+      ;;
+    --partition-key-mode|-p)
+      if [[ $# -lt 2 ]]; then
+        usage
+        exit 2
+      fi
+      partition_key_mode="$2"
       shift 2
       ;;
     --account-name|-a)
@@ -61,6 +70,34 @@ case "$index_type_lower" in
     ;;
 esac
 
+case "$partition_key_mode" in
+  hpk)
+    variant_suffix="-hpk"
+    container_suffix="-hpk"
+    ;;
+  docid)
+    variant_suffix="-docid"
+    container_suffix=""
+    ;;
+  sessionid)
+    variant_suffix="-sessionid"
+    container_suffix="-sessionid"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
+
+if [[ "$normalized_index_type" == "diskANN" && "$partition_key_mode" != "docid" ]]; then
+  echo "hpk and sessionid partition-key variants are available for quantizedFlat only." >&2
+  exit 2
+fi
+
+if [[ "$normalized_index_type" == "diskANN" ]]; then
+  variant_suffix=""
+fi
+
 if [[ -z "$resource_group" ]]; then
   echo "Set resourceGroup or pass --resource-group before running this script." >&2
   exit 2
@@ -69,14 +106,6 @@ fi
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 cd "$repo_root"
-
-if [[ -x "./.venv/bin/python" ]]; then
-  python_bin="./.venv/bin/python"
-elif command -v python3 >/dev/null 2>&1; then
-  python_bin="python3"
-else
-  python_bin="python"
-fi
 
 scenarios=(
   "1 18 10 180000"
@@ -88,8 +117,8 @@ scenarios=(
 
 for scenario in "${scenarios[@]}"; do
   read -r config bulk_size num_clients total_docs <<< "$scenario"
-  param_file="./scenarios/infra/config-${config}-${normalized_index_type}.bicepparam"
-  container_name="s${config}-${normalized_index_type}"
+  param_file="./scenarios/infra/config-${config}-${normalized_index_type}${variant_suffix}.bicepparam"
+  container_name="s${config}-${normalized_index_type}${container_suffix}"
 
   echo
   echo "=== OpenAI config ${config} (${normalized_index_type}) ==="
@@ -101,10 +130,11 @@ for scenario in "${scenarios[@]}"; do
   az deployment group create --resource-group "$resource_group" --parameters "${deployment_parameters[@]}"
 
   echo "Running benchmark against ${container_name}"
-  "$python_bin" ./main.py \
+  dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- \
     --bulk-size "$bulk_size" \
     --num-clients "$num_clients" \
     --total-docs "$total_docs" \
-    --data-path ./data/open_ai_corpus-initial-indexing.json.bz2 \
-    --container-name "$container_name"
+    --data-path ./data/open_ai_corpus-initial-indexing.json \
+    --container-name "$container_name" \
+    --partition-key-mode "$partition_key_mode"
 done

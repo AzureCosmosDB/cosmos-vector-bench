@@ -1,9 +1,9 @@
 using '../../infra/main.bicep'
 
-param accountName = '<cosmos-db-account-name>'
+param accountName = '<existing-account-name>'
 param databaseName = 'testdb'
-param containerName = 's1-quantizedFlat'
-param partitionKeyPath = '/docid'
+param containerName = 's5-quantizedFlat'
+param partitionKeyPaths = ['/docid']
 param autoscaleMaxThroughput = 100000
 param vectorPath = '/emb'
 param vectorIndexType = 'quantizedFlat'

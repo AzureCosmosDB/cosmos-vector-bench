@@ -13,7 +13,13 @@ public static class Program
     {
         try
         {
-            ApplyOverrides(ParseArgs(args));
+            CliArgs parsed = ParseArgs(args);
+            if (parsed.Search == true && string.IsNullOrEmpty(parsed.PartitionKeyMode))
+            {
+                throw new ArgumentException("--search requires --partition-key-mode hpk|docid|sessionid");
+            }
+
+            ApplyOverrides(parsed);
         }
         catch (ArgumentException ex)
         {
@@ -33,9 +39,21 @@ public static class Program
         }
 
         Console.Write("\n");
-        Console.WriteLine(
-            $"Starting up benchmark run for num_clients={config.ClientProcesses}, " +
-            $"bulk_size={config.BulkSize}, max_documents={config.EffectiveTotalDocs}");
+        if (config.SearchEnabled)
+        {
+            Console.WriteLine(
+                $"Starting search benchmark for num_clients={config.ClientProcesses}, " +
+                $"queries_per_second_per_client={config.SearchQueriesPerSecond}, " +
+                $"total_queries={config.SearchTotalQueries}, " +
+                $"warmup_queries={(config.SearchWarmupEnabled ? BenchmarkConfig.SearchWarmupQueryCount : 0)}, " +
+                $"partition_key_fields={string.Join(',', config.PartitionKeyFields)}");
+        }
+        else
+        {
+            Console.WriteLine(
+                $"Starting up benchmark run for num_clients={config.ClientProcesses}, " +
+                $"bulk_size={config.BulkSize}, max_documents={config.EffectiveTotalDocs}");
+        }
 
         var benchmark = new Benchmark(config);
         return await benchmark.RunAsync().ConfigureAwait(false);
@@ -49,6 +67,11 @@ public static class Program
         public string? DataType { get; set; }
         public string? DataPath { get; set; }
         public string? ContainerName { get; set; }
+        public string? PartitionKeyMode { get; set; }
+        public bool? Search { get; set; }
+        public bool? Warmup { get; set; }
+        public int? QueriesPerSecond { get; set; }
+        public int? TotalQueries { get; set; }
     }
 
     private static CliArgs ParseArgs(string[] args)
@@ -76,6 +99,29 @@ public static class Program
                     break;
                 case "--container-name" or "--container_name":
                     parsed.ContainerName = NextValue(args, ref i, arg);
+                    break;
+                case "--partition-key-mode" or "--partition_key_mode":
+                    parsed.PartitionKeyMode = PartitionKeyModeValue(NextValue(args, ref i, arg), arg);
+                    break;
+                case "--search":
+                    parsed.Search = true;
+                    if (i + 1 < args.Length && !args[i + 1].StartsWith('-'))
+                    {
+                        parsed.Search = BooleanValue(NextValue(args, ref i, arg), arg);
+                    }
+                    break;
+                case "--warmup":
+                    parsed.Warmup = true;
+                    if (i + 1 < args.Length && !args[i + 1].StartsWith('-'))
+                    {
+                        parsed.Warmup = BooleanValue(NextValue(args, ref i, arg), arg);
+                    }
+                    break;
+                case "--queries-per-second" or "--queries_per_second":
+                    parsed.QueriesPerSecond = IntInRange(NextValue(args, ref i, arg), arg, 1, 100);
+                    break;
+                case "--total-queries" or "--total_queries":
+                    parsed.TotalQueries = PositiveInt(NextValue(args, ref i, arg), arg);
                     break;
                 case "-h" or "--help":
                     PrintUsage();
@@ -126,6 +172,41 @@ public static class Program
         {
             Environment.SetEnvironmentVariable("COSMOS_CONTAINER_NAME", args.ContainerName);
         }
+
+        if (!string.IsNullOrEmpty(args.PartitionKeyMode))
+        {
+            string partitionKeyFields = args.PartitionKeyMode switch
+            {
+                "hpk" => "sessionid,docid",
+                "docid" => "docid",
+                "sessionid" => "sessionid",
+                _ => throw new InvalidOperationException($"Unexpected partition-key mode: {args.PartitionKeyMode}"),
+            };
+            Environment.SetEnvironmentVariable("SESSION_ID_ENABLED", args.PartitionKeyMode == "docid" ? "false" : "true");
+            Environment.SetEnvironmentVariable("PARTITION_KEY_FIELDS", partitionKeyFields);
+            Environment.SetEnvironmentVariable("DOCUMENT_ID_FALLBACK_FIELD", "docid");
+            Environment.SetEnvironmentVariable("PARTITION_KEY_MODE_EXPLICIT", "true");
+        }
+
+        if (args.Search is bool search)
+        {
+            Environment.SetEnvironmentVariable("SEARCH_ENABLED", search ? "true" : "false");
+        }
+
+        if (args.Warmup is bool warmup)
+        {
+            Environment.SetEnvironmentVariable("SEARCH_WARMUP_ENABLED", warmup ? "true" : "false");
+        }
+
+        if (args.QueriesPerSecond is int queriesPerSecond)
+        {
+            Environment.SetEnvironmentVariable("SEARCH_QUERIES_PER_SECOND", queriesPerSecond.ToString(CultureInfo.InvariantCulture));
+        }
+
+        if (args.TotalQueries is int totalQueries)
+        {
+            Environment.SetEnvironmentVariable("SEARCH_TOTAL_QUERIES", totalQueries.ToString(CultureInfo.InvariantCulture));
+        }
     }
 
     private static string NextValue(string[] args, ref int i, string flag)
@@ -153,6 +234,27 @@ public static class Program
         return parsed;
     }
 
+    private static int IntInRange(string value, string flag, int minimum, int maximum)
+    {
+        int parsed = PositiveInt(value, flag);
+        if (parsed > maximum)
+        {
+            throw new ArgumentException($"{flag}: '{value}' must be between {minimum} and {maximum}");
+        }
+
+        return parsed;
+    }
+
+    private static bool BooleanValue(string value, string flag)
+    {
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "1" or "true" or "yes" or "on" => true,
+            "0" or "false" or "no" or "off" => false,
+            _ => throw new ArgumentException($"{flag}: '{value}' must be true or false"),
+        };
+    }
+
     private static string DataTypeValue(string value, string flag)
     {
         string normalized = value.Trim().ToLowerInvariant();
@@ -161,6 +263,18 @@ public static class Program
             "fake" => "fake",
             "file" or "json" => "file",
             _ => throw new ArgumentException($"{flag}: '{value}' must be one of: fake, file, json"),
+        };
+    }
+
+    private static string PartitionKeyModeValue(string value, string flag)
+    {
+        string normalized = value.Trim().ToLowerInvariant();
+        return normalized switch
+        {
+            "hpk" => "hpk",
+            "docid" => "docid",
+            "sessionid" => "sessionid",
+            _ => throw new ArgumentException($"{flag}: '{value}' must be one of: hpk, docid, sessionid"),
         };
     }
 
@@ -175,5 +289,10 @@ public static class Program
         Console.WriteLine("  --data-type <type>     Select data source: fake | file | json (json is an alias for file).");
         Console.WriteLine("  --data-path <path>     Override DOC_JSON_PATH and run with DATA_TYPE=file.");
         Console.WriteLine("  --container-name <name> Override COSMOS_CONTAINER_NAME from .env.");
+        Console.WriteLine("  --partition-key-mode <mode> Select hpk (sessionid,docid), docid, or sessionid.");
+        Console.WriteLine("  --search [true|false]    Run vector searches instead of document inserts; requires --partition-key-mode.");
+        Console.WriteLine("  --warmup [true|false]    Run 1000 untimed vector search queries before the test (default true).");
+        Console.WriteLine("  --queries-per-second <n> Target query starts per second per client (1-100, default 1).");
+        Console.WriteLine("  --total-queries <n>      Total queries shared across all clients (default 1000).");
     }
 }

@@ -34,13 +34,13 @@ public sealed class CosmosWriter
 
     private readonly BenchmarkConfig _config;
     private readonly Container _container;
-    private readonly string _partitionKeyField;
+    private readonly IReadOnlyList<string> _partitionKeyFields;
 
     public CosmosWriter(BenchmarkConfig config, Container container)
     {
         _config = config;
         _container = container;
-        _partitionKeyField = config.PartitionKeyField;
+        _partitionKeyFields = config.PartitionKeyFields;
     }
 
     /// <summary>Creates one Cosmos item and returns the per-attempt service-time windows in milliseconds.</summary>
@@ -195,14 +195,14 @@ public sealed class CosmosWriter
         => ScheduleBatchesAsync(batches, InsertDocAsync, sem, metrics, cancellationToken);
 
     /// <summary>Inserts batches of raw UTF-8 document bytes via stream writes (file mode fast path).</summary>
-    public Task InsertRawBatchesAsync(IAsyncEnumerable<List<byte[]>> batches, SemaphoreSlim sem, WorkerMetrics metrics, CancellationToken cancellationToken)
+    public Task InsertRawBatchesAsync(IAsyncEnumerable<List<DataSource.RawDocument>> batches, SemaphoreSlim sem, WorkerMetrics metrics, CancellationToken cancellationToken)
         => ScheduleBatchesAsync(batches, InsertRawDocAsync, sem, metrics, cancellationToken);
 
     /// <summary>
     /// Creates one Cosmos item from raw UTF-8 bytes using <c>CreateItemStreamAsync</c>, avoiding a JsonObject round-trip.
     /// Parsing, partition-key/id preparation, and re-serialization happen here on the worker so they run in parallel.
     /// </summary>
-    private async Task<List<double>> InsertRawDocAsync(byte[] raw, SemaphoreSlim sem, WorkerMetrics metrics, CancellationToken cancellationToken)
+    private async Task<List<double>> InsertRawDocAsync(DataSource.RawDocument rawDocument, SemaphoreSlim sem, WorkerMetrics metrics, CancellationToken cancellationToken)
     {
         await sem.WaitAsync(cancellationToken).ConfigureAwait(false);
         double start = Clock.Now;
@@ -215,7 +215,7 @@ public sealed class CosmosWriter
 
         try
         {
-            (byte[] payload, PartitionKey partitionKey) = PrepareRawDoc(raw);
+            (byte[] payload, PartitionKey partitionKey) = PrepareRawDoc(rawDocument);
 
             for (int attempt = 0; attempt <= _config.MaxInsertRetries; attempt++)
             {
@@ -321,8 +321,9 @@ public sealed class CosmosWriter
     /// <see cref="DataSource.PrepareLoadedDoc"/>: the partition key field is required and ids fall back to the
     /// partition key value.
     /// </summary>
-    private (byte[] Payload, PartitionKey PartitionKey) PrepareRawDoc(byte[] raw)
+    private (byte[] Payload, PartitionKey PartitionKey) PrepareRawDoc(DataSource.RawDocument rawDocument)
     {
+        byte[] raw = rawDocument.Payload;
         using JsonDocument doc = JsonDocument.Parse(raw);
         JsonElement root = doc.RootElement;
         if (root.ValueKind != JsonValueKind.Object)
@@ -330,18 +331,26 @@ public sealed class CosmosWriter
             throw new InvalidDataException($"Loaded record is {root.ValueKind}, expected a JSON object");
         }
 
-        bool hasPk = !string.IsNullOrEmpty(_partitionKeyField)
-            && root.TryGetProperty(_partitionKeyField, out JsonElement pkElement)
-            && !IsNullOrEmptyElement(pkElement);
-        if (!hasPk)
+        string[] missingFields = _partitionKeyFields.Where(field =>
+            !(field == "sessionid" && rawDocument.SessionId is not null)
+            && (!root.TryGetProperty(field, out JsonElement element) || IsNullOrEmptyElement(element)))
+            .ToArray();
+        if (missingFields.Length > 0)
         {
             string available = string.Join(", ", root.EnumerateObject().Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal).Take(20));
             throw new InvalidDataException(
-                $"Loaded record is missing required partition key field '{_partitionKeyField}'. Available fields: {available}");
+                $"Loaded record is missing required partition key field(s) '{string.Join(", ", missingFields)}'. Available fields: {available}");
         }
 
-        root.TryGetProperty(_partitionKeyField, out JsonElement pk);
         bool hasId = root.TryGetProperty("id", out JsonElement idElement) && !IsNullOrEmptyElement(idElement);
+        bool hasFallbackElement = root.TryGetProperty(_config.DocumentIdFallbackField, out JsonElement fallbackElement)
+            && !IsNullOrEmptyElement(fallbackElement);
+        bool hasFallback = _config.DocumentIdFallbackField == "sessionid" && rawDocument.SessionId is not null
+            || hasFallbackElement;
+        if (!hasId && !hasFallback)
+        {
+            throw new InvalidDataException($"Loaded record is missing id and fallback field '{_config.DocumentIdFallbackField}'");
+        }
 
         var buffer = new ArrayBufferWriter<byte>(raw.Length + 96);
         using (var writer = new Utf8JsonWriter(buffer))
@@ -353,17 +362,23 @@ public sealed class CosmosWriter
             {
                 writer.WriteStringValue(ElementToString(idElement));
             }
+            else if (_config.DocumentIdFallbackField == "sessionid" && rawDocument.SessionId is not null)
+            {
+                writer.WriteStringValue(rawDocument.SessionId);
+            }
             else
             {
-                writer.WriteStringValue(ElementToString(pk));
+                writer.WriteStringValue(ElementToString(fallbackElement));
             }
 
-            writer.WritePropertyName(_partitionKeyField);
-            pk.WriteTo(writer);
+            if (rawDocument.SessionId is not null)
+            {
+                writer.WriteString("sessionid", rawDocument.SessionId);
+            }
 
             foreach (JsonProperty property in root.EnumerateObject())
             {
-                if (property.NameEquals("id") || property.NameEquals(_partitionKeyField))
+                if (property.NameEquals("id") || rawDocument.SessionId is not null && property.NameEquals("sessionid"))
                 {
                     continue;
                 }
@@ -375,19 +390,40 @@ public sealed class CosmosWriter
         }
 
         byte[] payload = buffer.WrittenSpan.ToArray();
-        PartitionKey partitionKey = BuildPartitionKey(pk);
+        var partitionKeyBuilder = new PartitionKeyBuilder();
+        foreach (string field in _partitionKeyFields)
+        {
+            if (field == "sessionid" && rawDocument.SessionId is not null)
+            {
+                partitionKeyBuilder.Add(rawDocument.SessionId);
+            }
+            else
+            {
+                root.TryGetProperty(field, out JsonElement element);
+                AddPartitionKeyComponent(partitionKeyBuilder, element);
+            }
+        }
+        PartitionKey partitionKey = partitionKeyBuilder.Build();
         return (payload, partitionKey);
     }
 
-    private static PartitionKey BuildPartitionKey(JsonElement element)
+    private static void AddPartitionKeyComponent(PartitionKeyBuilder builder, JsonElement element)
     {
-        return element.ValueKind switch
+        switch (element.ValueKind)
         {
-            JsonValueKind.Number => new PartitionKey(element.GetDouble()),
-            JsonValueKind.True => new PartitionKey(true),
-            JsonValueKind.False => new PartitionKey(false),
-            _ => new PartitionKey(element.ValueKind == JsonValueKind.String ? element.GetString() : element.GetRawText()),
-        };
+            case JsonValueKind.Number:
+                builder.Add(element.GetDouble());
+                break;
+            case JsonValueKind.True:
+                builder.Add(true);
+                break;
+            case JsonValueKind.False:
+                builder.Add(false);
+                break;
+            default:
+                builder.Add(element.ValueKind == JsonValueKind.String ? element.GetString() : element.GetRawText());
+                break;
+        }
     }
 
     private static string ElementToString(JsonElement element)
@@ -410,31 +446,35 @@ public sealed class CosmosWriter
 
     private PartitionKey ResolvePartitionKey(JsonObject doc)
     {
-        if (string.IsNullOrEmpty(_partitionKeyField))
+        if (_partitionKeyFields.Count == 0)
         {
             // Fake mode has no configured partition key field; partition on id.
             return new PartitionKey(doc["id"]!.ToString());
         }
 
-        if (!doc.TryGetPropertyValue(_partitionKeyField, out JsonNode? node) || node is null)
+        var builder = new PartitionKeyBuilder();
+        foreach (string field in _partitionKeyFields)
         {
-            return new PartitionKey(doc["id"]?.ToString() ?? "");
-        }
-
-        if (node is JsonValue value)
-        {
-            if (value.TryGetValue(out double d))
+            if (!doc.TryGetPropertyValue(field, out JsonNode? node) || node is null)
             {
-                return new PartitionKey(d);
+                throw new InvalidDataException($"Document is missing required partition key field '{field}'");
             }
 
-            if (value.TryGetValue(out bool b))
+            if (node is JsonValue value && value.TryGetValue(out double number))
             {
-                return new PartitionKey(b);
+                builder.Add(number);
+            }
+            else if (node is JsonValue boolValue && boolValue.TryGetValue(out bool boolean))
+            {
+                builder.Add(boolean);
+            }
+            else
+            {
+                builder.Add(node.ToString());
             }
         }
 
-        return new PartitionKey(node.ToString());
+        return builder.Build();
     }
 
     private static bool IsRetryable(CosmosException ex) => RetryableStatusCodes.Contains(ex.StatusCode);
@@ -498,18 +538,18 @@ public sealed class CosmosWriter
             : System.Text.Encoding.UTF8.GetString(payload, 0, 512) + "...";
         Console.WriteLine("\n[cosmos error sample]");
         Console.WriteLine($"status={statusCode}");
-        Console.WriteLine($"partition_key_field={_partitionKeyField}");
+        Console.WriteLine($"partition_key_fields={string.Join(",", _partitionKeyFields)}");
         Console.WriteLine($"document={body}");
     }
 
     private void PrintErrorSample(CosmosException ex, JsonObject doc)
     {
-        object? partitionValue = string.IsNullOrEmpty(_partitionKeyField) ? null : doc[_partitionKeyField]?.ToString();
+        string partitionValue = string.Join(",", _partitionKeyFields.Select(field => doc[field]?.ToString() ?? ""));
         Console.WriteLine("\n[cosmos error sample]");
         Console.WriteLine($"status={(int)ex.StatusCode}");
         Console.WriteLine($"sub_status={ex.SubStatusCode}");
         Console.WriteLine($"id={doc["id"]}");
-        Console.WriteLine($"partition_key_field={_partitionKeyField}");
+        Console.WriteLine($"partition_key_fields={string.Join(",", _partitionKeyFields)}");
         Console.WriteLine($"partition_key_value={partitionValue}");
         Console.WriteLine($"request_charge={ex.RequestCharge:F2}");
         Console.WriteLine($"activity_id={ex.ActivityId}");

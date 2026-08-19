@@ -1,10 +1,10 @@
 using '../../infra/main.bicep'
 
-param accountName = 'cosmos-tests'
+param accountName = '<cosmos-db-account-name>'
 param databaseName = 'testdb'
-param containerName = 's6-quantizedFlat'
-param partitionKeyPath = '/docid'
-param autoscaleMaxThroughput = 1000000
+param containerName = 's1-quantizedFlat-sessionid'
+param partitionKeyPaths = ['/sessionid']
+param autoscaleMaxThroughput = 100000
 param vectorPath = '/emb'
 param vectorIndexType = 'quantizedFlat'
 param vectorDimensions = 1536

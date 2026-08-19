@@ -141,6 +141,46 @@ public sealed class MetricsReporter
         return string.Join("\n", lines);
     }
 
+    public string BuildSearchAggregateLine(
+        IReadOnlyList<SearchMetricSnapshot> snapshots,
+        long totalQueries,
+        int clientProcesses,
+        List<double> aggregateThroughputSamples)
+    {
+        double elapsed = SearchAggregateElapsed(snapshots);
+        int clientsActive = snapshots.Count(snapshot => snapshot.Started && !snapshot.Finished);
+        int clientsCompleted = snapshots.Count(snapshot => snapshot.Finished);
+        long completed = snapshots.Sum(snapshot => snapshot.Completed);
+        long success = snapshots.Sum(snapshot => snapshot.Success);
+        long errors = snapshots.Sum(snapshot => snapshot.Errors);
+        double currentThroughput = snapshots.Sum(snapshot => snapshot.CurrentQueriesPerSec);
+        if (snapshots.Any(snapshot => snapshot.Started))
+        {
+            aggregateThroughputSamples.Add(currentThroughput);
+        }
+
+        var totalTimes = snapshots.SelectMany(snapshot => snapshot.QueryTotalTimeMsSamples).Order().ToList();
+        double requestCharge = snapshots.Sum(snapshot => snapshot.RequestChargeTotal);
+        var lines = new List<string>
+        {
+            $"clients_active={clientsActive}/{clientProcesses}, clients_completed={clientsCompleted}/{clientProcesses}",
+            "  Progress",
+            $"    elapsed={F2(elapsed)}s",
+            $"    completed={completed}/{totalQueries}",
+            "  Throughput",
+            $"    current_search_queries/sec={F2(currentThroughput)}, current_search_queries/sec/client={F2(Stats.SafeDiv(currentThroughput, Math.Max(clientProcesses, 1)))}",
+            $"    mean_search_queries/sec={F2(Stats.Mean(aggregateThroughputSamples))}, mean_search_queries/sec/client={F2(Stats.SafeDiv(Stats.Mean(aggregateThroughputSamples), Math.Max(clientProcesses, 1)))}",
+            $"    max_search_queries/sec={F2(Stats.Max(aggregateThroughputSamples))}",
+            "  Query metrics",
+            $"    query_total_time_ms_mean={F2(Stats.Mean(totalTimes))}, query_total_time_ms_p50={F2(Stats.Percentile(totalTimes, 0.50))}, query_total_time_ms_p90={F2(Stats.Percentile(totalTimes, 0.90))}, query_total_time_ms_p99={F2(Stats.Percentile(totalTimes, 0.99))}",
+            "  Responses",
+            $"    success={success}, errors={errors}",
+            $"    avg_ru_per_search_query={F2(Stats.SafeDiv(requestCharge, completed))}",
+        };
+
+        return string.Join("\n", lines);
+    }
+
     /// <summary>Aggregates final per-worker results, prints the completion banner and final metrics, and writes the CSV row.</summary>
     public void PrintParentResult(IReadOnlyList<ResultSnapshot> results, double totalElapsedTimeSec)
     {
@@ -205,6 +245,49 @@ public sealed class MetricsReporter
         WriteMetricsCsv(row);
     }
 
+    public void PrintSearchResult(
+        IReadOnlyList<SearchResultSnapshot> results,
+        double searchElapsedTimeSec)
+    {
+        long completed = results.Sum(result => result.Completed);
+        long success = results.Sum(result => result.Success);
+        long errors = results.Sum(result => result.Errors);
+        int clientsCompleted = results.Count(result => result.FinishedEpoch is not null);
+        List<double> totalTimes = results.SelectMany(result => result.QueryTotalTimeMsSamples).Order().ToList();
+        List<double> throughputSamples = AggregateSearchThroughputSamples(results);
+        double meanThroughput = Stats.SafeDiv(completed, searchElapsedTimeSec);
+        if (throughputSamples.Count == 0 && meanThroughput > 0)
+        {
+            throughputSamples.Add(meanThroughput);
+        }
+
+        double requestCharge = results.Sum(result => result.RequestChargeTotal);
+        var row = new (string Name, string Value)[]
+        {
+            ("search_elapsed_time_sec", F2(searchElapsedTimeSec)),
+            ("clients", _config.ClientProcesses.ToString(CultureInfo.InvariantCulture)),
+            ("clients_active", "0"),
+            ("clients_completed", clientsCompleted.ToString(CultureInfo.InvariantCulture)),
+            ("configured_queries_per_sec_per_client", _config.SearchQueriesPerSecond.ToString(CultureInfo.InvariantCulture)),
+            ("configured_total_queries", _config.SearchTotalQueries.ToString(CultureInfo.InvariantCulture)),
+            ("queries_completed", completed.ToString(CultureInfo.InvariantCulture)),
+            ("success_total", success.ToString(CultureInfo.InvariantCulture)),
+            ("errors_total", errors.ToString(CultureInfo.InvariantCulture)),
+            ("mean_search_queries_per_sec", F2(meanThroughput)),
+            ("mean_search_queries_per_sec_per_client", F2(Stats.SafeDiv(meanThroughput, Math.Max(_config.ClientProcesses, 1)))),
+            ("max_search_queries_per_sec", F2(Stats.Max(throughputSamples))),
+            ("query_total_time_ms_mean", F2(Stats.Mean(totalTimes))),
+            ("query_total_time_ms_p50", F2(Stats.Percentile(totalTimes, 0.50))),
+            ("query_total_time_ms_p90", F2(Stats.Percentile(totalTimes, 0.90))),
+            ("query_total_time_ms_p99", F2(Stats.Percentile(totalTimes, 0.99))),
+            ("request_charge_total", F2(requestCharge)),
+            ("avg_ru_per_search_query", F2(Stats.SafeDiv(requestCharge, completed))),
+        };
+
+        PrintFinalMetrics(row);
+        WriteSearchMetricsCsv(row);
+    }
+
     private static void PrintFinalMetrics((string Name, string Value)[] row)
     {
         Console.WriteLine("\n***Benchmark completed!***\n");
@@ -245,6 +328,29 @@ public sealed class MetricsReporter
         Console.WriteLine($"metrics_csv_path={csvPath}");
     }
 
+    private void WriteSearchMetricsCsv((string Name, string Value)[] row)
+    {
+        if (!_config.CsvOutputEnabled)
+        {
+            return;
+        }
+
+        string fileName =
+            $"search-{_config.RunStartedAt.ToString("MMddyy-HHmmss", CultureInfo.InvariantCulture)}" +
+            $"-clients-{_config.ClientProcesses}" +
+            $"-qps-{_config.SearchQueriesPerSecond}" +
+            $"-queries-{_config.SearchTotalQueries}.csv";
+        string resultsRoot = Path.IsPathRooted(_config.TestResultsRoot)
+            ? _config.TestResultsRoot
+            : Path.Combine(_config.ProjectRoot, _config.TestResultsRoot);
+        Directory.CreateDirectory(resultsRoot);
+        string csvPath = Path.Combine(resultsRoot, fileName);
+        using var writer = new StreamWriter(csvPath, append: false, Encoding.UTF8);
+        writer.WriteLine(string.Join(",", row.Select(field => CsvField(field.Name))));
+        writer.WriteLine(string.Join(",", row.Select(field => CsvField(field.Value))));
+        Console.WriteLine($"metrics_csv_path={csvPath}");
+    }
+
     private static string CsvField(string value)
     {
         if (value.Contains(',') || value.Contains('"') || value.Contains('\n'))
@@ -264,6 +370,15 @@ public sealed class MetricsReporter
         }
 
         return Math.Max(Clock.Epoch - startedEpochs.Min(), 0.000001);
+    }
+
+    private static double SearchAggregateElapsed(IReadOnlyList<SearchMetricSnapshot> snapshots)
+    {
+        List<double> startedEpochs = snapshots
+            .Where(snapshot => snapshot.StartedEpoch is > 0)
+            .Select(snapshot => snapshot.StartedEpoch!.Value)
+            .ToList();
+        return startedEpochs.Count == 0 ? 0.0 : Math.Max(Clock.Epoch - startedEpochs.Min(), 0.000001);
     }
 
     private static double ResultElapsed(IReadOnlyList<ResultSnapshot> results)
@@ -291,6 +406,32 @@ public sealed class MetricsReporter
                 if (i < result.ThroughputDocsPerSecSamples.Count)
                 {
                     sum += result.ThroughputDocsPerSecSamples[i];
+                    any = true;
+                }
+            }
+
+            if (any)
+            {
+                aggregate.Add(sum);
+            }
+        }
+
+        return aggregate;
+    }
+
+    private static List<double> AggregateSearchThroughputSamples(IReadOnlyList<SearchResultSnapshot> results)
+    {
+        int maxLength = results.Count == 0 ? 0 : results.Max(result => result.ThroughputQueriesPerSecSamples.Count);
+        var aggregate = new List<double>(maxLength);
+        for (int index = 0; index < maxLength; index++)
+        {
+            double sum = 0.0;
+            bool any = false;
+            foreach (SearchResultSnapshot result in results)
+            {
+                if (index < result.ThroughputQueriesPerSecSamples.Count)
+                {
+                    sum += result.ThroughputQueriesPerSecSamples[index];
                     any = true;
                 }
             }
