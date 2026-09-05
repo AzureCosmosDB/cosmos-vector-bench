@@ -121,7 +121,7 @@ The data-plane scope can be narrowed from `/dbs` to `/dbs/<database>` or `/dbs/<
 
 Create or choose the target Cosmos DB for NoSQL account, database, and container before running the scenarios. The benchmark does not create these resources. For the OpenAI vector corpus, the container should have the vector policy and indexing policy you want to test, and its partition key should align with `docid`.
 
-Use a new container, or make sure the target container is empty before each scenario run. The writer uses create operations, so items that already exist with the same `id` and partition key are not overwritten; they fail as duplicate-item errors.
+Use a new or empty container when measuring initial-load throughput. The writer never overwrites an item with the same `id` and full logical partition key: Cosmos DB atomically rejects competing creates, and the benchmark reports the losing `409` responses as `conflicts_skipped` rather than fatal errors. These requests still consume request units and are excluded from successful insert throughput. This protects stored identity across concurrent processes but does not prevent duplicate requests from reaching Cosmos DB.
 
 Set the shared `.env` values in the root folder:
 
@@ -139,9 +139,6 @@ DOC_JSON_FORMAT=jsonl
 
 PARTITION_KEY_FIELDS=docid
 DOCUMENT_ID_FALLBACK_FIELD=docid
-SESSION_ID_ENABLED=false
-SESSION_ID_MIN_DOCS=10
-SESSION_ID_MAX_DOCS=1000
 DOC_QUEUE_MULTIPLIER=30
 MAX_CONCURRENCY=30
 COSMOS_ERROR_SAMPLE_LIMIT=0
@@ -178,6 +175,44 @@ After download, verify the benchmark input points to the decompressed file:
 DOC_JSON_PATH=./data/open_ai_corpus-initial-indexing.json
 ```
 
+To test `/sessionid` or hierarchical `/sessionid`, `/docid`, preprocess the decompressed JSONL corpus once. File-backed benchmark runs consume existing session IDs and never create or replace them at runtime.
+
+Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe .\src\add_sessionids.py `
+  --input .\data\open_ai_corpus-initial-indexing.json `
+  --output .\data\open_ai_corpus-initial-indexing-sessionid.json
+```
+
+macOS/Linux:
+
+```bash
+./.venv/bin/python ./src/add_sessionids.py \
+  --input ./data/open_ai_corpus-initial-indexing.json \
+  --output ./data/open_ai_corpus-initial-indexing-sessionid.json
+```
+
+Alternatively, use the standalone .NET 9 preprocessor:
+
+Windows PowerShell:
+
+```powershell
+dotnet run --project .\tools\AddSessionIds\AddSessionIds.csproj -c Release -- `
+  --input .\data\open_ai_corpus-initial-indexing.json `
+  --output .\data\open_ai_corpus-initial-indexing-sessionid.json
+```
+
+macOS/Linux:
+
+```bash
+dotnet run --project ./tools/AddSessionIds/AddSessionIds.csproj -c Release -- \
+  --input ./data/open_ai_corpus-initial-indexing.json \
+  --output ./data/open_ai_corpus-initial-indexing-sessionid.json
+```
+
+The preprocessor reads the corpus once and streams transformed records to an atomic temporary output. The default seed is 42 and assignments rotate across 1,000 active session slots. Completed sessions appear on 10–100 documents, sessions still active at EOF may be undersized, no session exceeds 100 documents, and adjacent documents always use different sessions. Existing `sessionid` values are overwritten. Progress is reported every 10,000 documents. Use `--session-pool-size` to tune the active pool. The command refuses to replace its output unless `--force` is supplied. Equal seeds are repeatable within one implementation, but Python and .NET output bytes differ because they use different random-number generators.
+
 
 ## Run Commands
 
@@ -189,7 +224,7 @@ Each scenario has one `DiskANN` parameter file and three `quantizedFlat` partiti
 | `sessionid` | `quantizedFlat-sessionid.bicepparam` | `quantizedFlat-sessionid` | `sessionid` |
 | `hpk` | `quantizedFlat-hpk.bicepparam` | `quantizedFlat-hpk` | `sessionid,docid` |
 
-The client defaults to process or `.env` configuration, which is `docid` in the repository setup. Passing `--partition-key-mode` selects the fields and enables generated `sessionid` values when required. The examples below show the original `docid` quantizedFlat flow. DiskANN continues to use its matching `config-*-diskANN.bicepparam` file and container name.
+The client defaults to process or `.env` configuration, which is `docid` in the repository setup. Passing `--partition-key-mode` selects the fields. For file input, `sessionid` and `hpk` modes require the preprocessed corpus above. The helper scripts select that file automatically for those modes. The examples below show the original `docid` quantizedFlat flow. DiskANN continues to use its matching `config-*-diskANN.bicepparam` file and container name.
 
 Before provisioning, edit the selected `.bicepparam` file and set `accountName` to your existing Cosmos DB account name. For manual deployments, use the scenario-specific files in `scenarios/infra/`, not the generic `infra/main.bicepparam`. The commands below create the matching container, point the benchmark process at that container, read the decompressed `.json` file, and write final metrics to `results/` when `CSV_OUTPUT_ENABLED=true`.
 
@@ -327,22 +362,76 @@ dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-
 
 ### Config 6
 
+Config 6 can be run against three quantizedFlat containers to compare partition distribution under the same 50-client, 240-document bulk, 2,000,000-document workload. Provision and test one container at a time unless you intend to keep multiple 1,200,000 RU/s autoscale-max containers. The `sessionid` and `hpk` variants require the preprocessed corpus created during [One-Time Setup](#one-time-setup).
+
+#### Config 6 with `/docid`
+
 Windows PowerShell:
 
 ```powershell
 $resourceGroup = '<account-resource-group-name>'
+$accountName = '<cosmos-account-name>'
 
 az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-6-quantizedFlat-docid.bicepparam
-dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 240 --num-clients 50 --total-docs 2000000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s6-quantizedFlat
+dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 240 --num-clients 50 --total-docs 2000000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s6-quantizedFlat --partition-key-mode docid
 ```
 
 macOS/Linux:
 
 ```bash
 resourceGroup='<account-resource-group-name>'
+accountName='<cosmos-account-name>'
 
 az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-6-quantizedFlat-docid.bicepparam
-dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 240 --num-clients 50 --total-docs 2000000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s6-quantizedFlat
+dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 240 --num-clients 50 --total-docs 2000000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s6-quantizedFlat --partition-key-mode docid
+```
+
+#### Config 6 with `/sessionid`
+
+**Prerequisite:** Run the session ID preprocessing script in [One-Time Setup](#one-time-setup) before this scenario. The commands below require the generated `open_ai_corpus-initial-indexing-sessionid.json` file.
+
+Windows PowerShell:
+
+```powershell
+$resourceGroup = '<account-resource-group-name>'
+$accountName = '<cosmos-account-name>'
+
+az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-6-quantizedFlat-sessionid.bicepparam
+dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 240 --num-clients 50 --total-docs 2000000 --data-path .\data\open_ai_corpus-initial-indexing-sessionid.json --container-name s6-quantizedFlat-sessionid --partition-key-mode sessionid
+```
+
+macOS/Linux:
+
+```bash
+resourceGroup='<account-resource-group-name>'
+accountName='<cosmos-account-name>'
+
+az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-6-quantizedFlat-sessionid.bicepparam
+dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 240 --num-clients 50 --total-docs 2000000 --data-path ./data/open_ai_corpus-initial-indexing-sessionid.json --container-name s6-quantizedFlat-sessionid --partition-key-mode sessionid
+```
+
+#### Config 6 with hierarchical `/sessionid`, `/docid`
+
+**Prerequisite:** Run the session ID preprocessing script in [One-Time Setup](#one-time-setup) before this scenario. The commands below require the generated `open_ai_corpus-initial-indexing-sessionid.json` file.
+
+Windows PowerShell:
+
+```powershell
+$resourceGroup = '<account-resource-group-name>'
+$accountName = '<cosmos-account-name>'
+
+az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-6-quantizedFlat-hpk.bicepparam
+dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 240 --num-clients 50 --total-docs 2000000 --data-path .\data\open_ai_corpus-initial-indexing-sessionid.json --container-name s6-quantizedFlat-hpk --partition-key-mode hpk
+```
+
+macOS/Linux:
+
+```bash
+resourceGroup='<account-resource-group-name>'
+accountName='<cosmos-account-name>'
+
+az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-6-quantizedFlat-hpk.bicepparam
+dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 240 --num-clients 50 --total-docs 2000000 --data-path ./data/open_ai_corpus-initial-indexing-sessionid.json --container-name s6-quantizedFlat-hpk --partition-key-mode hpk
 ```
 
 ### Config 7
@@ -373,6 +462,8 @@ dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-
 
 #### Config 7 with `/sessionid`
 
+**Prerequisite:** Run the session ID preprocessing script in [One-Time Setup](#one-time-setup) before this scenario. The commands below require the generated `open_ai_corpus-initial-indexing-sessionid.json` file.
+
 Windows PowerShell:
 
 ```powershell
@@ -380,7 +471,7 @@ $resourceGroup = '<account-resource-group-name>'
 $accountName = '<cosmos-account-name>'
 
 az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-7-quantizedFlat-sessionid.bicepparam
-dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 500 --num-clients 75 --total-docs 2000000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s7-quantizedFlat-sessionid --partition-key-mode sessionid
+dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 500 --num-clients 75 --total-docs 2000000 --data-path .\data\open_ai_corpus-initial-indexing-sessionid.json --container-name s7-quantizedFlat-sessionid --partition-key-mode sessionid
 ```
 
 macOS/Linux:
@@ -390,10 +481,12 @@ resourceGroup='<account-resource-group-name>'
 accountName='<cosmos-account-name>'
 
 az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-7-quantizedFlat-sessionid.bicepparam
-dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 500 --num-clients 75 --total-docs 2000000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s7-quantizedFlat-sessionid --partition-key-mode sessionid
+dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 500 --num-clients 75 --total-docs 2000000 --data-path ./data/open_ai_corpus-initial-indexing-sessionid.json --container-name s7-quantizedFlat-sessionid --partition-key-mode sessionid
 ```
 
 #### Config 7 with hierarchical `/sessionid`, `/docid`
+
+**Prerequisite:** Run the session ID preprocessing script in [One-Time Setup](#one-time-setup) before this scenario. The commands below require the generated `open_ai_corpus-initial-indexing-sessionid.json` file.
 
 Windows PowerShell:
 
@@ -402,7 +495,7 @@ $resourceGroup = '<account-resource-group-name>'
 $accountName = '<cosmos-account-name>'
 
 az deployment group create --resource-group $resourceGroup --parameters .\scenarios\infra\config-7-quantizedFlat-hpk.bicepparam
-dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 500 --num-clients 75 --total-docs 2000000 --data-path .\data\open_ai_corpus-initial-indexing.json --container-name s7-quantizedFlat-hpk --partition-key-mode hpk
+dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --bulk-size 500 --num-clients 75 --total-docs 2000000 --data-path .\data\open_ai_corpus-initial-indexing-sessionid.json --container-name s7-quantizedFlat-hpk --partition-key-mode hpk
 ```
 
 macOS/Linux:
@@ -412,8 +505,10 @@ resourceGroup='<account-resource-group-name>'
 accountName='<cosmos-account-name>'
 
 az deployment group create --resource-group "$resourceGroup" --parameters ./scenarios/infra/config-7-quantizedFlat-hpk.bicepparam
-dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 500 --num-clients 75 --total-docs 2000000 --data-path ./data/open_ai_corpus-initial-indexing.json --container-name s7-quantizedFlat-hpk --partition-key-mode hpk
+dotnet run --project ./src_dotnet/CosmosVectorBench.csproj -c Release -- --bulk-size 500 --num-clients 75 --total-docs 2000000 --data-path ./data/open_ai_corpus-initial-indexing-sessionid.json --container-name s7-quantizedFlat-hpk --partition-key-mode hpk
 ```
+
+The 500-document `bulk_size` remains an application scheduling group rather than a transactional batch. The preprocessed file interleaves session IDs across that input stream, while the Cosmos SDK continues dynamically batching concurrent point creates.
 
 #### Config 7 vector search in HPK mode
 

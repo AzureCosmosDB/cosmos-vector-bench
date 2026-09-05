@@ -10,21 +10,75 @@ namespace CosmosVectorBench;
 /// </summary>
 public static class DataSource
 {
-    public readonly record struct RawDocument(byte[] Payload, string? SessionId);
+    public readonly record struct RawDocument(byte[] Payload);
 
     public sealed class SessionIdAssigner
     {
+        private sealed class SessionSlot
+        {
+            public required string Id { get; init; }
+            public required int Remaining { get; set; }
+        }
+
+        private readonly object _gate = new();
         private readonly bool _enabled;
         private readonly int _minDocs;
         private readonly int _maxDocs;
-        private int _remaining;
-        private string? _sessionId;
+        private readonly int _writeQuantumDocs;
+        private readonly Func<string> _sessionIdFactory;
+        private readonly Func<int> _sessionSizeFactory;
+        private readonly SessionSlot[] _slots;
+        private int _slotIndex;
+        private int _quantumRemaining;
 
         public SessionIdAssigner(BenchmarkConfig config)
+            : this(
+                config.SessionIdEnabled,
+                config.SessionIdMinDocs,
+                config.SessionIdMaxDocs,
+                config.SessionPoolSize,
+                config.SessionWriteQuantumDocs)
         {
-            _enabled = config.SessionIdEnabled;
-            _minDocs = config.SessionIdMinDocs;
-            _maxDocs = config.SessionIdMaxDocs;
+        }
+
+        internal SessionIdAssigner(
+            bool enabled,
+            int minDocs,
+            int maxDocs,
+            int poolSize,
+            int writeQuantumDocs,
+            Func<string>? sessionIdFactory = null,
+            Func<int>? sessionSizeFactory = null)
+        {
+            if (minDocs < 1)
+            {
+                throw new ArgumentOutOfRangeException(nameof(minDocs));
+            }
+            if (maxDocs < minDocs)
+            {
+                throw new ArgumentOutOfRangeException(nameof(maxDocs));
+            }
+            if (poolSize < 1)
+            {
+                throw new ArgumentOutOfRangeException(nameof(poolSize));
+            }
+            if (writeQuantumDocs < 1)
+            {
+                throw new ArgumentOutOfRangeException(nameof(writeQuantumDocs));
+            }
+
+            _enabled = enabled;
+            _minDocs = minDocs;
+            _maxDocs = maxDocs;
+            _writeQuantumDocs = writeQuantumDocs;
+            _sessionIdFactory = sessionIdFactory ?? NewGuidId;
+            _sessionSizeFactory = sessionSizeFactory ?? (() => Random.Shared.Next(_minDocs, _maxDocs + 1));
+            _slots = enabled ? new SessionSlot[poolSize] : [];
+            for (int i = 0; i < _slots.Length; i++)
+            {
+                _slots[i] = NewSlot();
+            }
+            _quantumRemaining = writeQuantumDocs;
         }
 
         public string? Next()
@@ -34,15 +88,34 @@ public static class DataSource
                 return null;
             }
 
-            if (_remaining == 0)
+            lock (_gate)
             {
-                _sessionId = NewGuidId();
-                _remaining = Random.Shared.Next(_minDocs, _maxDocs + 1);
-            }
+                SessionSlot slot = _slots[_slotIndex];
+                string sessionId = slot.Id;
+                slot.Remaining--;
+                _quantumRemaining--;
 
-            _remaining--;
-            return _sessionId;
+                bool exhausted = slot.Remaining == 0;
+                if (exhausted)
+                {
+                    _slots[_slotIndex] = NewSlot();
+                }
+
+                if (exhausted || _quantumRemaining == 0)
+                {
+                    _slotIndex = (_slotIndex + 1) % _slots.Length;
+                    _quantumRemaining = _writeQuantumDocs;
+                }
+
+                return sessionId;
+            }
         }
+
+        private SessionSlot NewSlot() => new()
+        {
+            Id = _sessionIdFactory(),
+            Remaining = _sessionSizeFactory(),
+        };
     }
 
     /// <summary>
@@ -74,9 +147,15 @@ public static class DataSource
     }
 
     /// <summary>Generates synthetic document bulks for a contiguous range of values.</summary>
-    public static IEnumerable<List<JsonObject>> GenerateBulks(int startInclusive, int endExclusive, int bulkSize, string text, BenchmarkConfig config)
+    public static IEnumerable<List<JsonObject>> GenerateBulks(
+        int startInclusive,
+        int endExclusive,
+        int bulkSize,
+        string text,
+        BenchmarkConfig config,
+        SessionIdAssigner? sessionIds = null)
     {
-        var sessionIds = new SessionIdAssigner(config);
+        sessionIds ??= new SessionIdAssigner(config);
         for (int bulkStart = startInclusive; bulkStart < endExclusive; bulkStart += bulkSize)
         {
             int bulkEnd = Math.Min(bulkStart + bulkSize, endExclusive);
@@ -98,15 +177,16 @@ public static class DataSource
     public static JsonObject PrepareLoadedDoc(
         JsonObject doc,
         long recordNumber,
-        BenchmarkConfig config,
-        SessionIdAssigner? sessionIds = null)
-    {
-        if (config.SessionIdEnabled)
-        {
-            doc["sessionid"] = sessionIds?.Next();
-        }
+        BenchmarkConfig config)
+        => PrepareLoadedDoc(doc, recordNumber, config.PartitionKeyFields, config.DocumentIdFallbackField);
 
-        string[] missingFields = config.PartitionKeyFields
+    internal static JsonObject PrepareLoadedDoc(
+        JsonObject doc,
+        long recordNumber,
+        IReadOnlyList<string> partitionKeyFields,
+        string documentIdFallbackField)
+    {
+        string[] missingFields = partitionKeyFields
             .Where(field => !doc.TryGetPropertyValue(field, out JsonNode? node) || IsNullOrEmpty(node))
             .ToArray();
         if (missingFields.Length > 0)
@@ -130,10 +210,10 @@ public static class DataSource
             return doc;
         }
 
-        if (!doc.TryGetPropertyValue(config.DocumentIdFallbackField, out JsonNode? fallbackNode) || IsNullOrEmpty(fallbackNode))
+        if (!doc.TryGetPropertyValue(documentIdFallbackField, out JsonNode? fallbackNode) || IsNullOrEmpty(fallbackNode))
         {
             throw new InvalidDataException(
-                $"Loaded record {recordNumber} is missing id and fallback field '{config.DocumentIdFallbackField}'");
+                $"Loaded record {recordNumber} is missing id and fallback field '{documentIdFallbackField}'");
         }
 
         doc["id"] = fallbackNode!.ToString();
@@ -149,18 +229,17 @@ public static class DataSource
     {
         string path = config.DocJsonPath;
         long docsRead = 0;
-        var sessionIds = new SessionIdAssigner(config);
 
         switch (config.DocJsonFormat)
         {
             case "jsonl":
-                docsRead = StreamJsonLines(path, config, maxDocs, onDoc, cancellationToken, sessionIds);
+                docsRead = StreamJsonLines(path, config, maxDocs, onDoc, cancellationToken);
                 break;
             case "array":
-                docsRead = StreamJsonArray(path, config, maxDocs, onDoc, cancellationToken, sessionIds, multipleValues: false);
+                docsRead = StreamJsonArray(path, config, maxDocs, onDoc, cancellationToken, multipleValues: false);
                 break;
             case "multiple_values":
-                docsRead = StreamJsonArray(path, config, maxDocs, onDoc, cancellationToken, sessionIds, multipleValues: true);
+                docsRead = StreamJsonArray(path, config, maxDocs, onDoc, cancellationToken, multipleValues: true);
                 break;
             default:
                 throw new InvalidOperationException($"Unsupported DOC_JSON_FORMAT: {config.DocJsonFormat}");
@@ -176,13 +255,12 @@ public static class DataSource
     /// </summary>
     public static long StreamRawJsonDocs(BenchmarkConfig config, int? maxDocs, Action<RawDocument> onDoc, CancellationToken cancellationToken)
     {
-        var sessionIds = new SessionIdAssigner(config);
-        void AddSession(byte[] payload) => onDoc(new RawDocument(payload, sessionIds.Next()));
+        void AddDocument(byte[] payload) => onDoc(new RawDocument(payload));
         return config.DocJsonFormat switch
         {
-            "jsonl" => StreamRawJsonLines(config.DocJsonPath, maxDocs, AddSession, cancellationToken),
-            "array" => StreamRawJsonArray(config.DocJsonPath, maxDocs, AddSession, cancellationToken, multipleValues: false),
-            "multiple_values" => StreamRawJsonArray(config.DocJsonPath, maxDocs, AddSession, cancellationToken, multipleValues: true),
+            "jsonl" => StreamRawJsonLines(config.DocJsonPath, maxDocs, AddDocument, cancellationToken),
+            "array" => StreamRawJsonArray(config.DocJsonPath, maxDocs, AddDocument, cancellationToken, multipleValues: false),
+            "multiple_values" => StreamRawJsonArray(config.DocJsonPath, maxDocs, AddDocument, cancellationToken, multipleValues: true),
             _ => throw new InvalidOperationException($"Unsupported DOC_JSON_FORMAT: {config.DocJsonFormat}"),
         };
     }
@@ -275,8 +353,7 @@ public static class DataSource
         BenchmarkConfig config,
         int? maxDocs,
         Action<JsonObject> onDoc,
-        CancellationToken cancellationToken,
-        SessionIdAssigner sessionIds)
+        CancellationToken cancellationToken)
     {
         long docsRead = 0;
         long lineNumber = 0;
@@ -302,7 +379,7 @@ public static class DataSource
                 throw new InvalidDataException($"Invalid JSONL record at line {lineNumber}: {ex.Message}", ex);
             }
 
-            onDoc(PrepareLoadedDoc(doc, lineNumber, config, sessionIds));
+            onDoc(PrepareLoadedDoc(doc, lineNumber, config));
             docsRead++;
             if (maxDocs.HasValue && docsRead >= maxDocs.Value)
             {
@@ -319,7 +396,6 @@ public static class DataSource
         int? maxDocs,
         Action<JsonObject> onDoc,
         CancellationToken cancellationToken,
-        SessionIdAssigner sessionIds,
         bool multipleValues)
     {
         // Stream-parse either a top-level array of objects, or (multipleValues) a concatenation of JSON values.
@@ -352,7 +428,7 @@ public static class DataSource
                     continue;
                 }
 
-                onDoc(PrepareLoadedDoc(obj, docsRead + 1, config, sessionIds));
+                onDoc(PrepareLoadedDoc(obj, docsRead + 1, config));
                 docsRead++;
                 if (maxDocs.HasValue && docsRead >= maxDocs.Value)
                 {
@@ -379,7 +455,7 @@ public static class DataSource
             }
 
             var obj = (JsonObject)JsonNode.Parse(element.RootElement.GetRawText())!;
-            onDoc(PrepareLoadedDoc(obj, docsRead + 1, config, sessionIds));
+            onDoc(PrepareLoadedDoc(obj, docsRead + 1, config));
             docsRead++;
             if (maxDocs.HasValue && docsRead >= maxDocs.Value)
             {

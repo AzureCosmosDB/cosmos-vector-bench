@@ -65,9 +65,10 @@ public sealed class MetricsReporter
         double elapsed = AggregateElapsed(snapshots);
         int activeClients = snapshots.Count;
         long successTotal = snapshots.Sum(s => s.Success);
+        long conflictsTotal = snapshots.Sum(s => s.Conflicts);
         long errorsTotal = snapshots.Sum(s => s.Errors);
         long throttlesTotal = snapshots.Sum(s => s.ThrottlesWithRetry);
-        long completedTotal = successTotal + errorsTotal;
+        long completedTotal = successTotal + conflictsTotal + errorsTotal;
         double throughputCurrent = snapshots.Sum(s => s.CurrentDocsPerSec);
 
         if (snapshots.Any(s => s.Started))
@@ -134,7 +135,7 @@ public sealed class MetricsReporter
             "  Timing",
             $"    service_time_ms_mean={F2(serviceMean)}, service_time_ms_p50={F2(serviceP50)}, service_time_ms_p90={F2(serviceP90)}, service_time_ms_p99={F2(serviceP99)}",
             "  Responses",
-            $"    success={successTotal}, errors={errorsTotal}, throttles_w_retry={throttlesTotal}",
+            $"    success={successTotal}, conflicts_skipped={conflictsTotal}, errors={errorsTotal}, throttles_w_retry={throttlesTotal}",
             $"    avg_ru_per_operation={F2(avgRu)}",
         ]);
 
@@ -185,8 +186,9 @@ public sealed class MetricsReporter
     public void PrintParentResult(IReadOnlyList<ResultSnapshot> results, double totalElapsedTimeSec)
     {
         long successTotal = results.Sum(r => r.Success);
+        long conflictsTotal = results.Sum(r => r.Conflicts);
         long errorsTotal = results.Sum(r => r.Errors);
-        long docsCompleted = successTotal + errorsTotal;
+        long docsCompleted = successTotal + conflictsTotal + errorsTotal;
         long throttlesTotal = results.Sum(r => r.ThrottlesWithRetry);
         int clientsCompleted = results.Count;
 
@@ -219,6 +221,7 @@ public sealed class MetricsReporter
             ("clients_completed", clientsCompleted.ToString(CultureInfo.InvariantCulture)),
             ("docs_completed", docsCompleted.ToString(CultureInfo.InvariantCulture)),
             ("success_total", successTotal.ToString(CultureInfo.InvariantCulture)),
+            ("conflicts_skipped_total", conflictsTotal.ToString(CultureInfo.InvariantCulture)),
             ("errors_total", errorsTotal.ToString(CultureInfo.InvariantCulture)),
             ("throttles_w_retry_total", throttlesTotal.ToString(CultureInfo.InvariantCulture)),
             ("mean_docs_per_sec", F2(meanThroughput)),
@@ -235,6 +238,10 @@ public sealed class MetricsReporter
             ("bulk_errors", results.Sum(r => r.BulkErrors).ToString(CultureInfo.InvariantCulture)),
             ("bulk_docs_attempted", results.Sum(r => r.BulkDocsAttempted).ToString(CultureInfo.InvariantCulture)),
             ("bulk_docs_sampled", results.Sum(r => r.BulkDocsSampled).ToString(CultureInfo.InvariantCulture)),
+            ("session_pool_size", _config.DataType == "fake" ? _config.SessionPoolSize.ToString(CultureInfo.InvariantCulture) : ""),
+            ("session_write_quantum_docs", _config.DataType == "fake" ? _config.SessionWriteQuantumDocs.ToString(CultureInfo.InvariantCulture) : ""),
+            ("session_id_min_docs", _config.DataType == "fake" ? _config.SessionIdMinDocs.ToString(CultureInfo.InvariantCulture) : ""),
+            ("session_id_max_docs", _config.DataType == "fake" ? _config.SessionIdMaxDocs.ToString(CultureInfo.InvariantCulture) : ""),
             ("request_charge_total", F2(requestChargeTotal)),
             ("request_charge_observations", requestChargeObservations.ToString(CultureInfo.InvariantCulture)),
             ("avg_ru_per_operation", F2(Stats.SafeDiv(requestChargeTotal, requestChargeObservations))),

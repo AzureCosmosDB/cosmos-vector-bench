@@ -18,7 +18,7 @@ PARTITION_KEY_FIELDS=docid
 DOCUMENT_ID_FALLBACK_FIELD=docid
 ```
 
-`DATA_URL` is the remote file to download. `DATA_DIR` is where the downloaded and decompressed files are written. `DOC_JSON_PATH` should point to the plain JSON/JSONL file for repeatable throughput runs. The benchmark can stream a `.bz2` path directly, but that adds decompression work during each run and can limit client-side write throughput. Every loaded document must contain all `PARTITION_KEY_FIELDS` after optional session enrichment. If a source document is missing `id`, the writer copies `DOCUMENT_ID_FALLBACK_FIELD` into `id` before upload.
+`DATA_URL` is the remote file to download. `DATA_DIR` is where the downloaded and decompressed files are written. `DOC_JSON_PATH` should point to the plain JSON/JSONL file for repeatable throughput runs. The benchmark can stream a `.bz2` path directly, but that adds decompression work during each run and can limit client-side write throughput. Every loaded document must already contain all `PARTITION_KEY_FIELDS`. If a source document is missing `id`, the writer copies `DOCUMENT_ID_FALLBACK_FIELD` into `id` before upload.
 
 ## Download Data
 
@@ -56,6 +56,46 @@ With the default URL, the loader creates these files:
 data/open_ai_corpus-initial-indexing.json.bz2
 data/open_ai_corpus-initial-indexing.json
 ```
+
+## Add Session IDs for Partition-Key Tests
+
+After decompression, optionally create a separate JSONL corpus for `/sessionid` or hierarchical `/sessionid`, `/docid` tests:
+
+Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe .\src\add_sessionids.py `
+	--input .\data\open_ai_corpus-initial-indexing.json `
+	--output .\data\open_ai_corpus-initial-indexing-sessionid.json
+```
+
+macOS/Linux:
+
+```bash
+./.venv/bin/python ./src/add_sessionids.py \
+	--input ./data/open_ai_corpus-initial-indexing.json \
+	--output ./data/open_ai_corpus-initial-indexing-sessionid.json
+```
+
+Or use the standalone .NET 9 tool:
+
+Windows PowerShell:
+
+```powershell
+dotnet run --project .\tools\AddSessionIds\AddSessionIds.csproj -c Release -- `
+	--input .\data\open_ai_corpus-initial-indexing.json `
+	--output .\data\open_ai_corpus-initial-indexing-sessionid.json
+```
+
+macOS/Linux:
+
+```bash
+dotnet run --project ./tools/AddSessionIds/AddSessionIds.csproj -c Release -- \
+	--input ./data/open_ai_corpus-initial-indexing.json \
+	--output ./data/open_ai_corpus-initial-indexing-sessionid.json
+```
+
+The tool reads and transforms the JSONL file in one pass. Output is streamed to a temporary sibling and moved to the requested path only after successful completion. It preserves document order, replaces existing `sessionid` values, and reports progress every 10,000 documents by default. Assignments rotate across 1,000 active session slots; completed sessions use 10–100 documents, while sessions still active at EOF may be undersized. Use `--session-pool-size` to change the active pool. Generated files remain ignored by Git. Set `DOC_JSON_PATH=./data/open_ai_corpus-initial-indexing-sessionid.json` before a file-backed session partition-key run. Equal seeds are repeatable within Python or within .NET, but output bytes differ between the implementations because their random-number generators differ.
 
 Run the benchmark with `DATA_TYPE=file` and `DOC_JSON_PATH` pointing at the decompressed local file:
 

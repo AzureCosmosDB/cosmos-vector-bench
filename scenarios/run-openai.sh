@@ -98,6 +98,12 @@ if [[ "$normalized_index_type" == "diskANN" ]]; then
   variant_suffix=""
 fi
 
+if [[ "$partition_key_mode" == "docid" ]]; then
+  data_path="./data/open_ai_corpus-initial-indexing.json"
+else
+  data_path="./data/open_ai_corpus-initial-indexing-sessionid.json"
+fi
+
 if [[ -z "$resource_group" ]]; then
   echo "Set resourceGroup or pass --resource-group before running this script." >&2
   exit 2
@@ -106,6 +112,11 @@ fi
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 cd "$repo_root"
+
+if [[ ! -f "$data_path" ]]; then
+  echo "Input file not found: $data_path. Run src/add_sessionids.py or tools/AddSessionIds first for sessionid or hpk mode." >&2
+  exit 2
+fi
 
 scenarios=(
   "1 18 10 180000"
@@ -134,7 +145,7 @@ for scenario in "${scenarios[@]}"; do
     --bulk-size "$bulk_size" \
     --num-clients "$num_clients" \
     --total-docs "$total_docs" \
-    --data-path ./data/open_ai_corpus-initial-indexing.json \
+    --data-path "$data_path" \
     --container-name "$container_name" \
     --partition-key-mode "$partition_key_mode"
 done

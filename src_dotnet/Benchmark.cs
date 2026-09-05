@@ -202,13 +202,14 @@ public sealed class Benchmark
         var workers = new Task[_config.ClientProcesses];
         using var cts = new CancellationTokenSource();
         double totalStartedAt = Clock.Now;
+        var sessionIds = new DataSource.SessionIdAssigner(_config);
 
         for (int i = 0; i < _config.ClientProcesses; i++)
         {
             (int index, int start, int count) = slices[i];
             metrics[i] = new WorkerMetrics(_config);
             IAsyncEnumerable<List<JsonObject>> batches = Worker.ToAsync(
-                DataSource.GenerateBulks(start, start + count, _config.BulkSize, text, _config), cts.Token);
+                DataSource.GenerateBulks(start, start + count, _config.BulkSize, text, _config, sessionIds), cts.Token);
             workers[index] = Worker.RunAsync(writer, batches, metrics[index], _config.MaxInFlight, cts.Token);
         }
 

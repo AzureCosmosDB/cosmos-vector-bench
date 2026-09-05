@@ -13,6 +13,8 @@ skills_-lock.json
 # Distribution / packaging
 .Python
 build/
+**/bin/
+**/obj/
 develop-eggs/
 dist/
 downloads/

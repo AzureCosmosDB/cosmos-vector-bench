@@ -34,6 +34,8 @@ public sealed class BenchmarkConfig
     public bool SessionIdEnabled { get; private init; }
     public int SessionIdMinDocs { get; private init; }
     public int SessionIdMaxDocs { get; private init; }
+    public int SessionPoolSize { get; private init; }
+    public int SessionWriteQuantumDocs { get; private init; }
     public bool SearchEnabled { get; private init; }
     public bool SearchWarmupEnabled { get; private init; }
     public int SearchQueriesPerSecond { get; private init; }
@@ -111,6 +113,11 @@ public sealed class BenchmarkConfig
             partitionKeyFields = [partitionKeyField.TrimStart('/')];
         }
 
+        bool hpkSessionMode = dataType == "fake"
+            && partitionKeyFields.SequenceEqual(["sessionid", "docid"], StringComparer.OrdinalIgnoreCase);
+        int sessionIdMinDocs = IntEnv("SESSION_ID_MIN_DOCS", 10, 1);
+        int sessionIdMaxDocs = IntEnv("SESSION_ID_MAX_DOCS", 1000, 1);
+
         int effectiveTotalDocs = maxTotalDocs.HasValue ? Math.Min(totalDocs, maxTotalDocs.Value) : totalDocs;
         double liveInterval = FloatEnv("LIVE_INTERVAL_SEC", 1.0, 0.1);
         bool searchEnabled = BoolEnv("SEARCH_ENABLED", false);
@@ -137,8 +144,10 @@ public sealed class BenchmarkConfig
             PayloadBytes = IntEnv("PAYLOAD_BYTES", 5000, 0),
             FakeDataVectorDim = IntEnv("FAKE_DATA_VECTOR_DIM", 1536, 0),
             SessionIdEnabled = BoolEnv("SESSION_ID_ENABLED", false),
-            SessionIdMinDocs = IntEnv("SESSION_ID_MIN_DOCS", 10, 1),
-            SessionIdMaxDocs = IntEnv("SESSION_ID_MAX_DOCS", 1000, 1),
+            SessionIdMinDocs = sessionIdMinDocs,
+            SessionIdMaxDocs = sessionIdMaxDocs,
+            SessionPoolSize = IntEnv("SESSION_POOL_SIZE", hpkSessionMode ? 1000 : 1, 1),
+            SessionWriteQuantumDocs = IntEnv("SESSION_WRITE_QUANTUM_DOCS", hpkSessionMode ? 10 : sessionIdMaxDocs, 1),
             SearchEnabled = searchEnabled,
             SearchWarmupEnabled = searchEnabled ? BoolEnv("SEARCH_WARMUP_ENABLED", true) : true,
             SearchQueriesPerSecond = searchEnabled ? IntEnv("SEARCH_QUERIES_PER_SECOND", 1, 1) : 1,

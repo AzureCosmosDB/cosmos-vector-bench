@@ -167,4 +167,4 @@ az group delete `
 
 ## Notes
 
-Use a new or empty container for benchmark runs. The .NET writer uses create operations, so rerunning the same input against a populated container creates duplicate-item errors instead of overwriting existing documents.
+Use a new or empty container when measuring initial-load throughput. The .NET writer uses create operations, so rerunning the same input never overwrites an item with the same `id` and full logical partition key. Cosmos DB atomically rejects duplicate creates; the benchmark reports them as skipped conflicts, includes them in completed-document progress, and excludes them from successful insert throughput. Duplicate attempts still consume request units.

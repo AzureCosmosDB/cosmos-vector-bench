@@ -6,6 +6,13 @@ using Microsoft.Azure.Cosmos;
 
 namespace CosmosVectorBench;
 
+internal enum CreateFailureDisposition
+{
+    Conflict,
+    Retryable,
+    Error,
+}
+
 /// <summary>
 /// The Cosmos write hot path. Mirrors the Python <c>insert_doc</c> / <c>insert_bulk</c> / <c>insert_doc_batches</c>
 /// behavior: a per-worker concurrency semaphore, local <c>BULK_SIZE</c> grouping, bounded pending bulks,
@@ -108,7 +115,15 @@ public sealed class CosmosWriter
                         metrics.RecordThrottle();
                     }
 
-                    if (attempt < _config.MaxInsertRetries && IsRetryable(ex))
+                    CreateFailureDisposition disposition = ClassifyFailureStatus((int)ex.StatusCode);
+                    if (disposition == CreateFailureDisposition.Conflict)
+                    {
+                        metrics.RecordConflict();
+                        metrics.RecordRequestCharge(requestChargeTotal);
+                        break;
+                    }
+
+                    if (attempt < _config.MaxInsertRetries && disposition == CreateFailureDisposition.Retryable)
                     {
                         await Task.Delay(RetryDelay(ex, attempt + 1), cancellationToken).ConfigureAwait(false);
                         continue;
@@ -289,7 +304,15 @@ public sealed class CosmosWriter
                     metrics.RecordThrottle();
                 }
 
-                if (attempt < _config.MaxInsertRetries && IsRetryableStatus(statusCode))
+                CreateFailureDisposition disposition = ClassifyFailureStatus(statusCode);
+                if (disposition == CreateFailureDisposition.Conflict)
+                {
+                    metrics.RecordConflict();
+                    metrics.RecordRequestCharge(requestChargeTotal);
+                    break;
+                }
+
+                if (attempt < _config.MaxInsertRetries && disposition == CreateFailureDisposition.Retryable)
                 {
                     await Task.Delay(RetryDelay(retryAfter, attempt + 1), cancellationToken).ConfigureAwait(false);
                     continue;
@@ -332,8 +355,7 @@ public sealed class CosmosWriter
         }
 
         string[] missingFields = _partitionKeyFields.Where(field =>
-            !(field == "sessionid" && rawDocument.SessionId is not null)
-            && (!root.TryGetProperty(field, out JsonElement element) || IsNullOrEmptyElement(element)))
+            !root.TryGetProperty(field, out JsonElement element) || IsNullOrEmptyElement(element))
             .ToArray();
         if (missingFields.Length > 0)
         {
@@ -345,8 +367,7 @@ public sealed class CosmosWriter
         bool hasId = root.TryGetProperty("id", out JsonElement idElement) && !IsNullOrEmptyElement(idElement);
         bool hasFallbackElement = root.TryGetProperty(_config.DocumentIdFallbackField, out JsonElement fallbackElement)
             && !IsNullOrEmptyElement(fallbackElement);
-        bool hasFallback = _config.DocumentIdFallbackField == "sessionid" && rawDocument.SessionId is not null
-            || hasFallbackElement;
+        bool hasFallback = hasFallbackElement;
         if (!hasId && !hasFallback)
         {
             throw new InvalidDataException($"Loaded record is missing id and fallback field '{_config.DocumentIdFallbackField}'");
@@ -362,23 +383,14 @@ public sealed class CosmosWriter
             {
                 writer.WriteStringValue(ElementToString(idElement));
             }
-            else if (_config.DocumentIdFallbackField == "sessionid" && rawDocument.SessionId is not null)
-            {
-                writer.WriteStringValue(rawDocument.SessionId);
-            }
             else
             {
                 writer.WriteStringValue(ElementToString(fallbackElement));
             }
 
-            if (rawDocument.SessionId is not null)
-            {
-                writer.WriteString("sessionid", rawDocument.SessionId);
-            }
-
             foreach (JsonProperty property in root.EnumerateObject())
             {
-                if (property.NameEquals("id") || rawDocument.SessionId is not null && property.NameEquals("sessionid"))
+                if (property.NameEquals("id"))
                 {
                     continue;
                 }
@@ -393,15 +405,8 @@ public sealed class CosmosWriter
         var partitionKeyBuilder = new PartitionKeyBuilder();
         foreach (string field in _partitionKeyFields)
         {
-            if (field == "sessionid" && rawDocument.SessionId is not null)
-            {
-                partitionKeyBuilder.Add(rawDocument.SessionId);
-            }
-            else
-            {
-                root.TryGetProperty(field, out JsonElement element);
-                AddPartitionKeyComponent(partitionKeyBuilder, element);
-            }
+            root.TryGetProperty(field, out JsonElement element);
+            AddPartitionKeyComponent(partitionKeyBuilder, element);
         }
         PartitionKey partitionKey = partitionKeyBuilder.Build();
         return (payload, partitionKey);
@@ -477,9 +482,17 @@ public sealed class CosmosWriter
         return builder.Build();
     }
 
-    private static bool IsRetryable(CosmosException ex) => RetryableStatusCodes.Contains(ex.StatusCode);
+    internal static CreateFailureDisposition ClassifyFailureStatus(int statusCode)
+    {
+        if (statusCode == (int)HttpStatusCode.Conflict)
+        {
+            return CreateFailureDisposition.Conflict;
+        }
 
-    private static bool IsRetryableStatus(int statusCode) => RetryableStatusCodes.Contains((HttpStatusCode)statusCode);
+        return RetryableStatusCodes.Contains((HttpStatusCode)statusCode)
+            ? CreateFailureDisposition.Retryable
+            : CreateFailureDisposition.Error;
+    }
 
     private static TimeSpan? ParseRetryAfter(Headers headers)
     {

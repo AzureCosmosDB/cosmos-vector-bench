@@ -79,6 +79,7 @@ public sealed record MetricSnapshot
     public required bool Started { get; init; }
     public required double? StartedEpoch { get; init; }
     public required long Success { get; init; }
+    public required long Conflicts { get; init; }
     public required long Errors { get; init; }
     public required long ThrottlesWithRetry { get; init; }
     public required long CreateItemAttempts { get; init; }
@@ -100,6 +101,7 @@ public sealed record ResultSnapshot
     public required double? StartedEpoch { get; init; }
     public required double? FinishedEpoch { get; init; }
     public required long Success { get; init; }
+    public required long Conflicts { get; init; }
     public required long Errors { get; init; }
     public required long ThrottlesWithRetry { get; init; }
     public required long CreateItemAttempts { get; init; }
@@ -127,6 +129,7 @@ public sealed class WorkerMetrics
     private readonly double _totalStartedAt = Clock.Now;
 
     private long _success;
+    private long _conflicts;
     private long _errors;
     private long _throttlesWithRetry;
     private long _createItemAttempts;
@@ -207,6 +210,14 @@ public sealed class WorkerMetrics
         lock (_sync)
         {
             _success++;
+        }
+    }
+
+    public void RecordConflict()
+    {
+        lock (_sync)
+        {
+            _conflicts++;
         }
     }
 
@@ -427,6 +438,7 @@ public sealed class WorkerMetrics
                 Started = _startedAt is not null,
                 StartedEpoch = _startedEpoch,
                 Success = _success,
+                Conflicts = _conflicts,
                 Errors = _errors,
                 ThrottlesWithRetry = _throttlesWithRetry,
                 CreateItemAttempts = _createItemAttempts,
@@ -456,6 +468,7 @@ public sealed class WorkerMetrics
                 StartedEpoch = _startedEpoch,
                 FinishedEpoch = _finishedEpoch,
                 Success = _success,
+                Conflicts = _conflicts,
                 Errors = _errors,
                 ThrottlesWithRetry = _throttlesWithRetry,
                 CreateItemAttempts = _createItemAttempts,
