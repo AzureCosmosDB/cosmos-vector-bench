@@ -18,6 +18,7 @@ Python implementation:
 - `src/data.py` contains runtime fake-doc and JSON/JSONL document sources.
 - `src/config.py` loads repo-root `.env` and benchmark configuration.
 - `src/download_data.py` downloads source datasets into `data/` and can optionally decompress `.bz2` files.
+- `src/add_sessionids.py` creates a deterministic JSONL copy with interleaved `sessionid` values for session partition-key tests.
 - `counts.py` streams a JSON/JSONL corpus and compares total records with unique `docid` values.
 
 .NET implementation (`src_dotnet/`):
@@ -29,6 +30,11 @@ Python implementation:
 - `DataSource.cs` contains the fake-doc generator and JSON/JSONL document streaming.
 - `BenchmarkConfig.cs` loads the same repo-root `.env` and benchmark configuration.
 - `Metrics.cs` and `MetricsReporter.cs` track metrics and write the same CSV columns.
+
+.NET preprocessing tool (`tools/AddSessionIds/`):
+
+- `Program.cs` provides a standalone JSONL preprocessing CLI without Azure or Cosmos DB dependencies.
+- `JsonlSessionIdPreprocessor.cs` assigns deterministic, interleaved `sessionid` values using bounded-memory one-pass processing.
 
 ## Scenarios
 
@@ -123,7 +129,7 @@ The data-plane scope can be narrowed from `/dbs` to `/dbs/<database>` or `/dbs/<
 
    Create or choose a Cosmos DB for NoSQL account, a database, and a container with the partition key and vector policy you want to test. The script expects the database and container to already exist. It authenticates with `COSMOS_KEY` when that value is set, and falls back to `DefaultAzureCredential` (Entra ID) when it is blank.
 
-   Use a new container, or make sure the target container is empty before each file-based benchmark run. The writer uses create operations, so items that already exist with the same `id` and partition key are not overwritten; they fail as duplicate-item errors.
+   Use a new or empty container when measuring initial-load throughput. The .NET writer uses create operations, so an existing item with the same `id` and full logical partition key is never overwritten. Cosmos DB atomically rejects the duplicate, and the .NET benchmark reports it as a skipped conflict rather than a fatal error. Skipped conflicts consume request units and are excluded from successful insert throughput.
 
 2. Configure `.env`.
 
@@ -185,13 +191,14 @@ results/052326-143508-clients-40-bulk-30-maxdocs-all.csv
 
 ## .NET Implementation (Alternative)
 
-The `src_dotnet/` project is a .NET 9 port of the benchmark. It reads the same root `.env`, accepts the same CLI overrides as `main.py`, uses the same scenario configs and decompressed data files, and writes metrics CSVs with the same columns into `results/`. Use it when you prefer a .NET client or want to compare client-runtime behavior.
+The `src_dotnet/` project is a .NET 9 port of the benchmark. It reads the same root `.env`, accepts the same CLI overrides as `main.py`, uses the same scenario configs and decompressed data files, and writes compatible metrics CSVs into `results/`. Use it when you prefer a .NET client or want to compare client-runtime behavior.
 
 Differences from the Python implementation:
 
-- It uses the native Cosmos SDK `AllowBulkExecution` write path (concurrent point creates batched by the SDK) instead of the Python per-item path, so raw docs/sec is not directly comparable between the two; the CSV schema still matches for side-by-side runs.
+- It uses the native Cosmos SDK `AllowBulkExecution` write path (concurrent point creates batched by the SDK) instead of the Python per-item path, so raw docs/sec is not directly comparable between the two. The .NET insert CSV adds `conflicts_skipped_total` to the shared metrics columns.
 - Concurrency uses in-process logical clients (`NUM_CLIENTS` async worker loops) rather than child processes.
 - Input must be a decompressed `.json`/`.jsonl` file. Reading `.bz2` directly is not supported, so download and decompress first (`src/download_data.py`).
+- Concurrent threads or processes may attempt the same source item, but Cosmos DB permits only one create for a given `id` and full logical partition key. The .NET benchmark counts losing `409 Conflict` responses as `conflicts_skipped`, includes them in completed-document progress, excludes them from successful insert throughput, and does not fail a run containing only successes and skipped conflicts. The same `id` under a different logical partition key identifies a different item.
 
 ### Prerequisites
 
@@ -303,17 +310,75 @@ macOS/Linux:
 ./.venv/bin/python ./main.py --num-clients 4
 ```
 
-To add a synthetic `sessionid` to either fake or file-input documents, enable session grouping:
+To add generated `sessionid` values to synthetic documents, enable fake-data session grouping:
 
 ```dotenv
 SESSION_ID_ENABLED=true
 SESSION_ID_MIN_DOCS=10
 SESSION_ID_MAX_DOCS=1000
+SESSION_POOL_SIZE=1000
+SESSION_WRITE_QUANTUM_DOCS=10
 ```
 
-Consecutive documents share one random session GUID. A new GUID and group size are generated only when the previous group is exhausted. The final group can be shorter when a bounded run ends. Set `PARTITION_KEY_FIELDS=sessionid` for a session partition key or `PARTITION_KEY_FIELDS=sessionid,docid` for an ordered hierarchical partition key.
+These settings apply only to `DATA_TYPE=fake`. `SESSION_POOL_SIZE` is the number of concurrently active generated sessions, not the total number of sessions in a run. Each session receives a random total lifetime from `SESSION_ID_MIN_DOCS` through `SESSION_ID_MAX_DOCS`. The scheduler assigns at most `SESSION_WRITE_QUANTUM_DOCS` consecutive documents to one active session and then rotates round-robin.
 
-For a single run, prefer `--partition-key-mode hpk|docid|sessionid`. The option sets session generation, ordered partition-key fields, and `DOCUMENT_ID_FALLBACK_FIELD=docid` together. When omitted, the benchmark uses process and `.env` settings; the repository default remains `docid`.
+For synthetic documents with ordered HPK fields `sessionid,docid`, the .NET implementation defaults to 1,000 active sessions and a 10-document quantum when the two scheduling settings are omitted. Other partition-key modes default to a pool size of 1 and a quantum equal to `SESSION_ID_MAX_DOCS`.
+
+`BULK_SIZE` remains an application scheduling and metrics group. It is not a Cosmos DB transactional batch. Every item is submitted as an independent concurrent point create, and `AllowBulkExecution` dynamically groups those operations inside the Cosmos SDK. Keep `BULK_SIZE` large enough to sustain concurrency; use the session quantum to smooth temporal partition-key pressure rather than serializing small micro-batches.
+
+### Preprocess file input with session IDs
+
+File-backed benchmarks never generate or replace `sessionid` at runtime. To test `/sessionid` or hierarchical `/sessionid`, `/docid` partition keys, create a separate preprocessed JSONL file after downloading and decompressing the corpus:
+
+Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe .\src\add_sessionids.py `
+   --input .\data\open_ai_corpus-initial-indexing.json `
+   --output .\data\open_ai_corpus-initial-indexing-sessionid.json
+```
+
+macOS/Linux:
+
+```bash
+./.venv/bin/python ./src/add_sessionids.py \
+   --input ./data/open_ai_corpus-initial-indexing.json \
+   --output ./data/open_ai_corpus-initial-indexing-sessionid.json
+```
+
+The equivalent standalone .NET 9 tool can be used without setting up Python. Progress is reported every 10,000 documents by default.
+
+Windows PowerShell:
+
+```powershell
+dotnet run --project .\tools\AddSessionIds\AddSessionIds.csproj -c Release -- `
+   --input .\data\open_ai_corpus-initial-indexing.json `
+   --output .\data\open_ai_corpus-initial-indexing-sessionid.json
+```
+
+macOS/Linux:
+
+```bash
+dotnet run --project ./tools/AddSessionIds/AddSessionIds.csproj -c Release -- \
+   --input ./data/open_ai_corpus-initial-indexing.json \
+   --output ./data/open_ai_corpus-initial-indexing-sessionid.json
+```
+
+The utility supports uncompressed JSONL, preserves document order, replaces any existing `sessionid`, and defaults to random seed `42`. It reads the input once and immediately writes each transformed record to a temporary sibling file. The requested output name appears only after successful completion. The command fails if the output exists; pass `--force` to replace it. Sessions still active when EOF is reached can be below the 10-document minimum. Use `--session-pool-size`, `--min-session-docs`, `--max-session-docs`, and `--seed` to tune this behavior.
+
+Both implementations are repeatable for the same seed within that implementation. Python and .NET use different seeded random-number generators, so their generated IDs and output bytes are not expected to match each other. Both produce the same distribution guarantees. Use `--progress-every` to change the 10,000-document reporting interval.
+
+Then point the benchmark at the generated file:
+
+```powershell
+dotnet run --project .\src_dotnet\CosmosVectorBench.csproj -c Release -- --data-path .\data\open_ai_corpus-initial-indexing-sessionid.json --partition-key-mode hpk
+```
+
+Set `PARTITION_KEY_FIELDS=sessionid` for a scalar session partition key or `PARTITION_KEY_FIELDS=sessionid,docid` for an ordered hierarchical partition key. File loading validates these fields and fails before successful ingestion if the selected input was not preprocessed.
+
+For a single run, prefer `--partition-key-mode hpk|docid|sessionid`. The option sets ordered partition-key fields and `DOCUMENT_ID_FALLBACK_FIELD=docid`. It enables generated sessions for fake data, while file data must already contain `sessionid`. When omitted, the benchmark uses process and `.env` settings; the repository default remains `docid`.
+
+For fake data, the .NET CLI also accepts `--session-pool-size` and `--session-write-quantum-docs`. Enable `PARTITION_KEY_RANGE_RPS_ENABLED=true` when comparing configurations, and inspect Azure Monitor normalized RU consumption to confirm that no physical partition range remains saturated.
 
 ## Test Partition Key Strategies
 
@@ -408,7 +473,7 @@ Leave it blank for the full file:
 MAX_TOTAL_DOCS=
 ```
 
-Cosmos DB requires every item to have an `id`, and file-input records must contain every configured `PARTITION_KEY_FIELDS` component after optional session enrichment. If a source document does not already have an `id`, the writer copies `DOCUMENT_ID_FALLBACK_FIELD` into `id`. Keep that fallback as `docid` when partitioning by `sessionid`, otherwise documents in one session would receive duplicate IDs.
+Cosmos DB requires every item to have an `id`, and file-input records must already contain every configured `PARTITION_KEY_FIELDS` component. If a source document does not already have an `id`, the writer copies `DOCUMENT_ID_FALLBACK_FIELD` into `id`. Keep that fallback as `docid` when partitioning by `sessionid`, otherwise documents in one session would receive duplicate IDs.
 
 ## CLI Overrides
 
@@ -421,7 +486,7 @@ Both clients apply CLI arguments before loading benchmark configuration. Provide
 | `--total-docs` | `TOTAL_DOCS`, `MAX_TOTAL_DOCS` | Fake mode document count; JSON mode upload cap. |
 | `--data-path` | `DOC_JSON_PATH`, `DATA_TYPE=file` | Uses the provided JSON/JSONL file. Paths ending in `.bz2` are decompressed while reading. |
 | `--container-name` | `COSMOS_CONTAINER_NAME` | Target Cosmos DB container name. Wins over `.env` when specified. |
-| `--partition-key-mode` | `SESSION_ID_ENABLED`, `PARTITION_KEY_FIELDS`, `DOCUMENT_ID_FALLBACK_FIELD` | Selects `hpk` (`sessionid,docid`), `docid`, or `sessionid` atomically. |
+| `--partition-key-mode` | `SESSION_ID_ENABLED`, `PARTITION_KEY_FIELDS`, `DOCUMENT_ID_FALLBACK_FIELD` | Selects `hpk` (`sessionid,docid`), `docid`, or `sessionid`. Session generation applies only to fake mode; file input is validated as-is. |
 | `--search` | search mode | .NET only. Skips inserts and requires an explicit `--partition-key-mode`. |
 | `--warmup` | `SEARCH_WARMUP_ENABLED` | .NET search warmup toggle. Accepts optional `true` or `false`; defaults to `true` and runs 1,000 untimed queries. |
 | `--queries-per-second` | `SEARCH_QUERIES_PER_SECOND` | .NET search query starts per second per logical client. Range: 1-100; default: 1. |
@@ -472,9 +537,11 @@ The benchmark loads `.env` and `main.py` can override common values from CLI arg
 | `TOTAL_DOCS` | int | `1000000` | Number of fake docs generated when `DATA_TYPE=fake`. Also bounded by `MAX_TOTAL_DOCS` if set. |
 | `PAYLOAD_BYTES` | int | `5000` | Synthetic payload size for fake docs only. |
 | `FAKE_DATA_VECTOR_DIM` | int | `1536` | Number of random vector values generated for each fake document. |
-| `SESSION_ID_ENABLED` | bool | `false` | Adds or replaces `sessionid` on fake and file-input documents. |
-| `SESSION_ID_MIN_DOCS` | int | `10` | Inclusive minimum target number of consecutive documents per generated session. |
-| `SESSION_ID_MAX_DOCS` | int | `1000` | Inclusive maximum target number of consecutive documents per generated session. |
+| `SESSION_ID_ENABLED` | bool | `false` | Fake mode only: adds generated `sessionid` values to synthetic documents. File input is never enriched at runtime. |
+| `SESSION_ID_MIN_DOCS` | int | `10` | Fake mode only: inclusive minimum lifetime of a generated session. |
+| `SESSION_ID_MAX_DOCS` | int | `1000` | Fake mode only: inclusive maximum lifetime of a generated session. |
+| `SESSION_POOL_SIZE` | int | mode-dependent | .NET fake mode only: number of concurrently active generated sessions. Fake HPK defaults to 1,000; other modes default to 1. |
+| `SESSION_WRITE_QUANTUM_DOCS` | int | mode-dependent | .NET fake mode only: consecutive assignments per active session before round-robin rotation. Fake HPK defaults to 10. |
 | `SEARCH_WARMUP_ENABLED` | bool | `true` | Runs 1,000 untimed .NET vector search queries before measured search statistics begin. Disable with `false` or `--warmup false`. |
 | `SEARCH_QUERIES_PER_SECOND` | int | `1` | .NET search query-start rate per logical client. CLI range is 1-100. |
 | `SEARCH_TOTAL_QUERIES` | int | `1000` | Total .NET search queries divided across all logical clients. |

@@ -7,7 +7,7 @@ param partitionKeyPaths = [
   '/sessionid'
   '/docid'
 ]
-param autoscaleMaxThroughput = 2000000
+param autoscaleMaxThroughput = 2400000
 param vectorPath = '/emb'
 param vectorIndexType = 'quantizedFlat'
 param vectorDimensions = 1536

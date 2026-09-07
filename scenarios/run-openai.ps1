@@ -50,6 +50,11 @@ $containerSuffix = switch ($PartitionKeyMode) {
     'sessionid' { '-sessionid' }
     default { '' }
 }
+$dataPath = if ($PartitionKeyMode -eq 'docid') {
+    '.\data\open_ai_corpus-initial-indexing.json'
+} else {
+    '.\data\open_ai_corpus-initial-indexing-sessionid.json'
+}
 $projectPath = '.\src_dotnet\CosmosVectorBench.csproj'
 
 $scenarios = @(
@@ -62,6 +67,10 @@ $scenarios = @(
 
 Push-Location $repoRoot
 try {
+    if (-not (Test-Path -LiteralPath $dataPath -PathType Leaf)) {
+        throw "Input file not found: $dataPath. Run src/add_sessionids.py or tools/AddSessionIds first for sessionid or hpk mode."
+    }
+
     foreach ($scenario in $scenarios) {
         $config = $scenario.Config
         $paramFile = ".\scenarios\infra\config-$config-$normalizedIndexType$variantSuffix.bicepparam"
@@ -84,7 +93,7 @@ try {
             --bulk-size $scenario['BulkSize'] `
             --num-clients $scenario['NumClients'] `
             --total-docs $scenario['TotalDocs'] `
-            --data-path .\data\open_ai_corpus-initial-indexing.json `
+            --data-path $dataPath `
             --container-name $containerName `
             --partition-key-mode $PartitionKeyMode
 

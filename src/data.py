@@ -85,7 +85,6 @@ def make_doc(i: int, payload: str, session_ids: SessionIdAssigner | None = None)
 def _prepare_loaded_doc(
     doc: object,
     record_number: int,
-    session_ids: SessionIdAssigner | None = None,
 ) -> dict:
     """Validate a loaded source record and ensure it has a Cosmos id.
 
@@ -97,8 +96,6 @@ def _prepare_loaded_doc(
         raise ValueError(f"Loaded record {record_number} is {type(doc).__name__}, expected a JSON object")
 
     prepared = doc
-    if session_ids is not None:
-        session_ids.add_to(prepared)
 
     missing_fields = [
         field for field in PARTITION_KEY_FIELDS
@@ -191,7 +188,6 @@ def stream_json_docs(filepath: str, work_queue: mp.Queue, worker_count: int, sta
 
     docs_read = 0
     pending_docs = []
-    session_ids = SessionIdAssigner()
     started = time.perf_counter()
     if status is not None:
         status["docs_read"] = 0
@@ -221,7 +217,7 @@ def stream_json_docs(filepath: str, work_queue: mp.Queue, worker_count: int, sta
                         doc = json.loads(raw)
                     except json.JSONDecodeError as exc:
                         raise ValueError(f"Invalid JSONL record at line {line_number}: {exc}") from exc
-                    enqueue_doc(_prepare_loaded_doc(doc, line_number, session_ids))
+                    enqueue_doc(_prepare_loaded_doc(doc, line_number))
                     docs_read += 1
                     if status is not None and docs_read % 1000 == 0:
                         status["docs_read"] = docs_read
@@ -229,7 +225,7 @@ def stream_json_docs(filepath: str, work_queue: mp.Queue, worker_count: int, sta
                         break
             elif DOC_JSON_FORMAT == "multiple_values":
                 for doc in ijson.items(stream, "", multiple_values=True):
-                    enqueue_doc(_prepare_loaded_doc(doc, docs_read + 1, session_ids))
+                    enqueue_doc(_prepare_loaded_doc(doc, docs_read + 1))
                     docs_read += 1
                     if status is not None and docs_read % 1000 == 0:
                         status["docs_read"] = docs_read
@@ -237,7 +233,7 @@ def stream_json_docs(filepath: str, work_queue: mp.Queue, worker_count: int, sta
                         break
             else:
                 for doc in ijson.items(stream, "item"):
-                    enqueue_doc(_prepare_loaded_doc(doc, docs_read + 1, session_ids))
+                    enqueue_doc(_prepare_loaded_doc(doc, docs_read + 1))
                     docs_read += 1
                     if status is not None and docs_read % 1000 == 0:
                         status["docs_read"] = docs_read

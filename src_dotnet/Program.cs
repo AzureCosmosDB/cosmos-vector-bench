@@ -50,9 +50,15 @@ public static class Program
         }
         else
         {
+            string syntheticSessions = config.DataType == "fake"
+                ? $", session_pool_size={config.SessionPoolSize}, " +
+                  $"session_write_quantum_docs={config.SessionWriteQuantumDocs}, " +
+                  $"session_docs={config.SessionIdMinDocs}-{config.SessionIdMaxDocs}"
+                : "";
             Console.WriteLine(
                 $"Starting up benchmark run for num_clients={config.ClientProcesses}, " +
-                $"bulk_size={config.BulkSize}, max_documents={config.EffectiveTotalDocs}");
+                $"bulk_size={config.BulkSize}, max_documents={config.EffectiveTotalDocs}, " +
+                $"partition_key_fields={string.Join(',', config.PartitionKeyFields)}{syntheticSessions}");
         }
 
         var benchmark = new Benchmark(config);
@@ -68,6 +74,8 @@ public static class Program
         public string? DataPath { get; set; }
         public string? ContainerName { get; set; }
         public string? PartitionKeyMode { get; set; }
+        public int? SessionPoolSize { get; set; }
+        public int? SessionWriteQuantumDocs { get; set; }
         public bool? Search { get; set; }
         public bool? Warmup { get; set; }
         public int? QueriesPerSecond { get; set; }
@@ -102,6 +110,12 @@ public static class Program
                     break;
                 case "--partition-key-mode" or "--partition_key_mode":
                     parsed.PartitionKeyMode = PartitionKeyModeValue(NextValue(args, ref i, arg), arg);
+                    break;
+                case "--session-pool-size" or "--session_pool_size":
+                    parsed.SessionPoolSize = PositiveInt(NextValue(args, ref i, arg), arg);
+                    break;
+                case "--session-write-quantum-docs" or "--session_write_quantum_docs":
+                    parsed.SessionWriteQuantumDocs = PositiveInt(NextValue(args, ref i, arg), arg);
                     break;
                 case "--search":
                     parsed.Search = true;
@@ -186,6 +200,16 @@ public static class Program
             Environment.SetEnvironmentVariable("PARTITION_KEY_FIELDS", partitionKeyFields);
             Environment.SetEnvironmentVariable("DOCUMENT_ID_FALLBACK_FIELD", "docid");
             Environment.SetEnvironmentVariable("PARTITION_KEY_MODE_EXPLICIT", "true");
+        }
+
+        if (args.SessionPoolSize is int sessionPoolSize)
+        {
+            Environment.SetEnvironmentVariable("SESSION_POOL_SIZE", sessionPoolSize.ToString(CultureInfo.InvariantCulture));
+        }
+
+        if (args.SessionWriteQuantumDocs is int sessionWriteQuantumDocs)
+        {
+            Environment.SetEnvironmentVariable("SESSION_WRITE_QUANTUM_DOCS", sessionWriteQuantumDocs.ToString(CultureInfo.InvariantCulture));
         }
 
         if (args.Search is bool search)
@@ -290,6 +314,8 @@ public static class Program
         Console.WriteLine("  --data-path <path>     Override DOC_JSON_PATH and run with DATA_TYPE=file.");
         Console.WriteLine("  --container-name <name> Override COSMOS_CONTAINER_NAME from .env.");
         Console.WriteLine("  --partition-key-mode <mode> Select hpk (sessionid,docid), docid, or sessionid.");
+        Console.WriteLine("  --session-pool-size <n> Fake mode: number of concurrently active generated session IDs.");
+        Console.WriteLine("  --session-write-quantum-docs <n> Fake mode: docs per active session before rotation.");
         Console.WriteLine("  --search [true|false]    Run vector searches instead of document inserts; requires --partition-key-mode.");
         Console.WriteLine("  --warmup [true|false]    Run 1000 untimed vector search queries before the test (default true).");
         Console.WriteLine("  --queries-per-second <n> Target query starts per second per client (1-100, default 1).");
